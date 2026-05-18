@@ -1,0 +1,2 @@
+"""Scryfall art downloader package."""
+

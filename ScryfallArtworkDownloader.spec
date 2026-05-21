@@ -50,6 +50,7 @@ a = Analysis(
         ("assets/logo.ico", "assets"),
         ("assets/logo_upscale.ico", "assets"),
         ("assets/logo_margin.ico", "assets"),
+        ("assets/logo_trim.ico", "assets"),
     ] + tk_datas,
     hiddenimports=["PIL", "PIL.Image", "tkinter", "_tkinter"],
     hookspath=[],

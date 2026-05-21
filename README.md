@@ -130,6 +130,12 @@ Margin_Creator
 
 Chaque image compatible est normalisee en `3193x4457`, puis copiee avec une marge harmonisee de `144` pixels par cote. Le fichier final mesure `3481x4745` et est enregistre a `1200` DPI.
 
+## Ratio Cropper
+
+Le quatrieme onglet permet de selectionner une image puis de la recadrer au ratio `0.714:1`.
+La selection est centree par defaut et peut etre deplacee ou redimensionnee avec les poignees blanches.
+Le ratio reste verrouille et le fichier final est obtenu uniquement par decoupe de l'image source, sans ajout de contenu.
+
 ## Structure
 
 - `main.py`: point d'entree de l'application.
@@ -141,6 +147,7 @@ Chaque image compatible est normalisee en `3193x4457`, puis copiee avec une marg
 - `build-linux-executable.sh`: generation de l'executable Linux.
 - `lancer-scryfall-downloader.sh`: lanceur Linux.
 - `scryfall_art_downloader/app.py`: interface graphique.
+- `scryfall_art_downloader/aspect_cropper.py`: recadrage des images au ratio 0.714:1.
 - `scryfall_art_downloader/dpi_upscaler.py`: copie des images avec DPI 1200.
 - `scryfall_art_downloader/margin_creator.py`: creation de cadres noirs autour des images.
 - `scryfall_art_downloader/url_parser.py`: lecture des liens Scryfall.

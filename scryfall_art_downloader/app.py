@@ -7,6 +7,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .aspect_cropper import TARGET_ASPECT_RATIO, centered_crop_rect, crop_image_to_ratio
 from .downloader import ArtDownloader
 from .dpi_upscaler import upscale_folder_dpi
 from .margin_creator import create_black_margins
@@ -22,7 +23,8 @@ class ScryfallArtApp(tk.Tk):
         super().__init__()
         self.title("Scryfall Artwork Downloader")
         self.geometry("820x540")
-        self.resizable(False, False)
+        self.minsize(820, 540)
+        self.resizable(True, True)
         self.configure(bg="#202020")
         self.overrideredirect(True)
         try:
@@ -35,6 +37,7 @@ class ScryfallArtApp(tk.Tk):
         self.header_logo = self._load_logo_image(54)
         self.upscale_header_logo = self._load_logo_image(54, names=("logo_upscale.ico", "logo.png"))
         self.margin_header_logo = self._load_logo_image(54, names=("logo_margin.ico", "logo.png"))
+        self.trim_header_logo = self._load_logo_image(54, names=("logo_trim.ico", "logo.png"))
         self.iconphoto(True, self.taskbar_logo)
 
         self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -44,8 +47,23 @@ class ScryfallArtApp(tk.Tk):
         self.upscale_cancel_event = threading.Event()
         self.margin_worker: threading.Thread | None = None
         self.margin_cancel_event = threading.Event()
+        self.crop_source_image = None
+        self.crop_preview_image = None
+        self.crop_rect: tuple[float, float, float, float] | None = None
+        self.crop_scale = 1.0
+        self.crop_offset = (0, 0)
+        self.crop_drag_mode: str | None = None
+        self.crop_drag_start = (0.0, 0.0)
+        self.crop_drag_rect: tuple[float, float, float, float] | None = None
+        self.is_fullscreen = False
+        self.normal_geometry = "820x540"
+        self.fullscreen_button: tk.Button | None = None
         self._drag_start_x = 0
         self._drag_start_y = 0
+        self._resize_start_x = 0
+        self._resize_start_y = 0
+        self._resize_start_width = 820
+        self._resize_start_height = 540
 
         self.url_var = tk.StringVar(value=self.URL_PLACEHOLDER)
         self.card_url_var = tk.StringVar(value=self.CARD_URL_PLACEHOLDER)
@@ -56,10 +74,14 @@ class ScryfallArtApp(tk.Tk):
         self.upscale_output_var = tk.StringVar(value="")
         self.margin_folder_var = tk.StringVar(value="")
         self.margin_output_var = tk.StringVar(value="")
+        self.crop_image_var = tk.StringVar(value="")
+        self.crop_output_var = tk.StringVar(value="")
+        self.crop_status_var = tk.StringVar(value="Choisis une image pour préparer le recadrage.")
 
         self._build_ui()
         self._center_window()
         self.bind("<Map>", self._restore_borderless)
+        self.bind("<Escape>", self._exit_fullscreen)
         self.after(100, self._poll_messages)
         self.after(150, self._show_in_windows_taskbar)
 
@@ -180,11 +202,57 @@ class ScryfallArtApp(tk.Tk):
         self._drag_start_y = event.y
 
     def _move_window(self, event: tk.Event) -> None:
+        if self.is_fullscreen:
+            return
         x = self.winfo_pointerx() - self._drag_start_x
         y = self.winfo_pointery() - self._drag_start_y
         self.geometry(f"+{x}+{y}")
 
+    def _start_resize(self, event: tk.Event) -> None:
+        if self.is_fullscreen:
+            return
+        self._resize_start_x = self.winfo_pointerx()
+        self._resize_start_y = self.winfo_pointery()
+        self._resize_start_width = self.winfo_width()
+        self._resize_start_height = self.winfo_height()
+
+    def _resize_window(self, event: tk.Event) -> None:
+        if self.is_fullscreen:
+            return
+        width = max(820, self._resize_start_width + self.winfo_pointerx() - self._resize_start_x)
+        height = max(540, self._resize_start_height + self.winfo_pointery() - self._resize_start_y)
+        self.geometry(f"{width}x{height}")
+
+    def _toggle_fullscreen(self) -> None:
+        if self.is_fullscreen:
+            self._set_fullscreen(False)
+        else:
+            self.normal_geometry = self.geometry()
+            self._set_fullscreen(True)
+
+    def _exit_fullscreen(self, event: tk.Event | None = None) -> None:
+        if self.is_fullscreen:
+            self._set_fullscreen(False)
+
+    def _set_fullscreen(self, enabled: bool) -> None:
+        self.is_fullscreen = enabled
+        try:
+            self.attributes("-fullscreen", enabled)
+        except tk.TclError:
+            if enabled:
+                self.geometry(
+                    f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0"
+                )
+            else:
+                self.geometry(self.normal_geometry)
+        if not enabled:
+            self.geometry(self.normal_geometry)
+        if self.fullscreen_button is not None:
+            self.fullscreen_button.configure(text="▢" if enabled else "□")
+
     def _minimize_window(self) -> None:
+        if self.is_fullscreen:
+            self._set_fullscreen(False)
         self.overrideredirect(False)
         self.iconify()
 
@@ -261,21 +329,30 @@ class ScryfallArtApp(tk.Tk):
         title.bind("<B1-Motion>", self._move_window)
 
         self._make_window_button(titlebar, "X", self.destroy).pack(side=tk.RIGHT)
+        self.fullscreen_button = self._make_window_button(titlebar, "□", self._toggle_fullscreen)
+        self.fullscreen_button.pack(side=tk.RIGHT)
         self._make_window_button(titlebar, "-", self._minimize_window).pack(side=tk.RIGHT)
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        resize_grip = ttk.Sizegrip(self)
+        resize_grip.place(relx=1.0, rely=1.0, anchor="se")
+        resize_grip.bind("<ButtonPress-1>", self._start_resize)
+        resize_grip.bind("<B1-Motion>", self._resize_window)
 
         scraper_tab = ttk.Frame(notebook)
         upscaler_tab = ttk.Frame(notebook)
         margin_tab = ttk.Frame(notebook)
+        crop_tab = ttk.Frame(notebook)
         notebook.add(scraper_tab, text="Scryfall Downloader")
         notebook.add(upscaler_tab, text="DPI Upscaler")
         notebook.add(margin_tab, text="Margin Creator")
+        notebook.add(crop_tab, text="Ratio Cropper")
 
         self._build_scraper_tab(scraper_tab)
         self._build_upscaler_tab(upscaler_tab)
         self._build_margin_tab(margin_tab)
+        self._build_crop_tab(crop_tab)
 
     def _build_scraper_tab(self, root: ttk.Frame) -> None:
         root.columnconfigure(1, weight=1)
@@ -415,6 +492,59 @@ class ScryfallArtApp(tk.Tk):
         self.margin_log = self._make_log_widget(root)
         self.margin_log.grid(row=6, column=0, columnspan=3, sticky="nsew")
 
+    def _build_crop_tab(self, root: ttk.Frame) -> None:
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(6, weight=1)
+
+        header = ttk.Frame(root, style="Header.TFrame", padding=12)
+        header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        header.columnconfigure(1, weight=1)
+
+        logo = tk.Label(header, image=self.trim_header_logo, bg="#242424")
+        logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
+
+        ttk.Label(header, text="Ratio Cropper", style="HeaderTitle.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(header, text="Recadre au ratio 0.714:1 sans générer de contenu", style="HeaderSub.TLabel").grid(
+            row=1, column=1, sticky="w"
+        )
+
+        ttk.Label(root, text="Image source").grid(row=1, column=0, sticky="w")
+        ttk.Entry(root, textvariable=self.crop_image_var).grid(row=1, column=1, sticky="ew", padx=(12, 8))
+        ttk.Button(root, text="Parcourir", command=self._choose_crop_image, width=12).grid(row=1, column=2, sticky="ew")
+
+        ttk.Label(root, text="Image de sortie").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(root, textvariable=self.crop_output_var).grid(row=2, column=1, sticky="ew", padx=(12, 8), pady=(12, 0))
+        ttk.Button(root, text="Parcourir", command=self._choose_crop_output, width=12).grid(
+            row=2, column=2, sticky="ew", pady=(12, 0)
+        )
+
+        ttk.Button(root, text="Enregistrer le crop", command=self._save_crop).grid(
+            row=3, column=1, sticky="w", padx=(12, 0), pady=(16, 0)
+        )
+        ttk.Button(root, text="Centrer", command=self._reset_crop_rect).grid(
+            row=3, column=1, sticky="w", padx=(165, 0), pady=(16, 0)
+        )
+        ttk.Label(root, text="Sélection").grid(row=4, column=0, sticky="w", pady=(16, 8))
+        ttk.Label(root, textvariable=self.crop_status_var, anchor="e").grid(
+            row=4, column=1, columnspan=2, sticky="ew", padx=(12, 0), pady=(16, 8)
+        )
+
+        self.crop_canvas = tk.Canvas(
+            root,
+            width=500,
+            height=260,
+            bg="#181818",
+            highlightthickness=1,
+            highlightbackground="#3b3b3b",
+            highlightcolor="#666666",
+            cursor="crosshair",
+        )
+        self.crop_canvas.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(0, 10))
+        self.crop_canvas.bind("<ButtonPress-1>", self._crop_press)
+        self.crop_canvas.bind("<B1-Motion>", self._crop_drag)
+        self.crop_canvas.bind("<ButtonRelease-1>", self._crop_release)
+        self.crop_canvas.bind("<Configure>", lambda event: self._draw_crop_canvas())
+
     @staticmethod
     def _make_log_widget(parent: tk.Widget) -> tk.Text:
         return tk.Text(
@@ -483,6 +613,256 @@ class ScryfallArtApp(tk.Tk):
         folder = filedialog.askdirectory(initialdir=self.margin_output_var.get() or self.margin_folder_var.get() or ".")
         if folder:
             self.margin_output_var.set(folder)
+
+    def _choose_crop_image(self) -> None:
+        filetypes = (
+            ("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"),
+            ("Tous les fichiers", "*.*"),
+        )
+        filename = filedialog.askopenfilename(initialdir=".", filetypes=filetypes)
+        if not filename:
+            return
+
+        self.crop_image_var.set(filename)
+        source = Path(filename)
+        if not self.crop_output_var.get().strip():
+            self.crop_output_var.set(str(source.with_name(f"{source.stem}_ratio_0714{source.suffix}")))
+        self._load_crop_image(source)
+
+    def _choose_crop_output(self) -> None:
+        initial = self.crop_output_var.get().strip() or self.crop_image_var.get().strip() or "."
+        source_suffix = Path(self.crop_image_var.get()).suffix or ".png"
+        filename = filedialog.asksaveasfilename(
+            initialfile=Path(initial).name or "image_ratio_0714.png",
+            initialdir=str(Path(initial).parent) if Path(initial).parent else ".",
+            defaultextension=source_suffix,
+            filetypes=(
+                ("Images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"),
+                ("Tous les fichiers", "*.*"),
+            ),
+        )
+        if filename:
+            self.crop_output_var.set(filename)
+
+    def _load_crop_image(self, path: Path) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            messagebox.showerror(
+                "Pillow manquant",
+                "Pillow n'est pas installé. Lance la compilation ou installe Pillow avec: py -3 -m pip install Pillow",
+            )
+            return
+
+        try:
+            self.crop_source_image = Image.open(path).copy()
+        except Exception as error:
+            messagebox.showerror("Image invalide", str(error))
+            return
+
+        self.crop_rect = tuple(float(value) for value in centered_crop_rect(self.crop_source_image.width, self.crop_source_image.height))
+        self._draw_crop_canvas()
+
+    def _reset_crop_rect(self) -> None:
+        if self.crop_source_image is None:
+            return
+        if self.crop_rect is None:
+            self.crop_rect = tuple(
+                float(value) for value in centered_crop_rect(self.crop_source_image.width, self.crop_source_image.height)
+            )
+        else:
+            left, top, right, bottom = self.crop_rect
+            width = right - left
+            max_width = min(float(self.crop_source_image.width), float(self.crop_source_image.height) * TARGET_ASPECT_RATIO)
+            width = max(1.0, min(width, max_width))
+            height = width / TARGET_ASPECT_RATIO
+            center_x = self.crop_source_image.width / 2
+            center_y = self.crop_source_image.height / 2
+            self.crop_rect = (
+                center_x - width / 2,
+                center_y - height / 2,
+                center_x + width / 2,
+                center_y + height / 2,
+            )
+        self._draw_crop_canvas()
+
+    def _save_crop(self) -> None:
+        source = self.crop_image_var.get().strip()
+        output = self.crop_output_var.get().strip()
+        if not source:
+            messagebox.showerror("Image invalide", "Veuillez sélectionner une image source.")
+            return
+        if not output:
+            messagebox.showerror("Fichier invalide", "Veuillez sélectionner un fichier de sortie.")
+            return
+        if self.crop_rect is None:
+            self._load_crop_image(Path(source))
+        if self.crop_rect is None:
+            messagebox.showerror("Selection invalide", "Veuillez sélectionner une zone de recadrage.")
+            return
+
+        try:
+            target = crop_image_to_ratio(source, output, tuple(int(round(value)) for value in self.crop_rect))
+        except Exception as error:
+            messagebox.showerror("Erreur", str(error))
+            return
+
+        self.crop_status_var.set(f"Enregistré: {target.name}")
+
+    def _draw_crop_canvas(self) -> None:
+        self.crop_canvas.delete("all")
+        canvas_width = max(1, self.crop_canvas.winfo_width() or 500)
+        canvas_height = max(1, self.crop_canvas.winfo_height() or 260)
+        if self.crop_source_image is None:
+            self.crop_canvas.create_text(
+                canvas_width / 2,
+                canvas_height / 2,
+                text="Aucune image",
+                fill="#9a9a9a",
+                font=("Segoe UI", 13, "bold"),
+            )
+            return
+
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            return
+
+        top_preview_margin = 12
+        bottom_preview_margin = 12
+        available_height = max(1, canvas_height - top_preview_margin - bottom_preview_margin)
+        source_width, source_height = self.crop_source_image.size
+        self.crop_scale = min(canvas_width / source_width, available_height / source_height)
+        preview_size = (max(1, round(source_width * self.crop_scale)), max(1, round(source_height * self.crop_scale)))
+        preview = self.crop_source_image.resize(preview_size, Image.Resampling.LANCZOS)
+        self.crop_preview_image = ImageTk.PhotoImage(preview)
+        offset_x = (canvas_width - preview.width) // 2
+        offset_y = top_preview_margin + max(0, (available_height - preview.height) // 2)
+        self.crop_offset = (offset_x, offset_y)
+
+        self.crop_canvas.create_image(offset_x, offset_y, image=self.crop_preview_image, anchor="nw")
+        if self.crop_rect is not None:
+            self._draw_crop_overlay()
+            left, top, right, bottom = tuple(round(value) for value in self.crop_rect)
+            self.crop_status_var.set(f"Zone: {right - left}x{bottom - top}px")
+
+    def _draw_crop_overlay(self) -> None:
+        if self.crop_rect is None:
+            return
+
+        left, top, right, bottom = self._source_rect_to_canvas(self.crop_rect)
+        image_left, image_top = self.crop_offset
+        image_right = image_left + round(self.crop_source_image.width * self.crop_scale)
+        image_bottom = image_top + round(self.crop_source_image.height * self.crop_scale)
+
+        self.crop_canvas.create_rectangle(image_left, image_top, image_right, top, fill="#000000", stipple="gray50", outline="")
+        self.crop_canvas.create_rectangle(image_left, bottom, image_right, image_bottom, fill="#000000", stipple="gray50", outline="")
+        self.crop_canvas.create_rectangle(image_left, top, left, bottom, fill="#000000", stipple="gray50", outline="")
+        self.crop_canvas.create_rectangle(right, top, image_right, bottom, fill="#000000", stipple="gray50", outline="")
+        self.crop_canvas.create_rectangle(left, top, right, bottom, outline="#ffffff", width=2)
+
+        for x, y in ((left, top), (right, top), (left, bottom), (right, bottom)):
+            self.crop_canvas.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill="#ffffff", outline="#181818")
+
+    def _source_rect_to_canvas(self, rect: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        offset_x, offset_y = self.crop_offset
+        return tuple(
+            (
+                offset_x + rect[0] * self.crop_scale,
+                offset_y + rect[1] * self.crop_scale,
+                offset_x + rect[2] * self.crop_scale,
+                offset_y + rect[3] * self.crop_scale,
+            )
+        )
+
+    def _canvas_to_source(self, x: float, y: float) -> tuple[float, float]:
+        offset_x, offset_y = self.crop_offset
+        if self.crop_source_image is None:
+            return (0.0, 0.0)
+        source_x = (x - offset_x) / self.crop_scale
+        source_y = (y - offset_y) / self.crop_scale
+        return (
+            max(0.0, min(float(self.crop_source_image.width), source_x)),
+            max(0.0, min(float(self.crop_source_image.height), source_y)),
+        )
+
+    def _crop_press(self, event: tk.Event) -> None:
+        if self.crop_source_image is None or self.crop_rect is None:
+            return
+
+        self.crop_drag_mode = self._crop_hit_test(event.x, event.y)
+        self.crop_drag_start = self._canvas_to_source(event.x, event.y)
+        self.crop_drag_rect = self.crop_rect
+
+    def _crop_drag(self, event: tk.Event) -> None:
+        if self.crop_source_image is None or self.crop_rect is None or self.crop_drag_rect is None or not self.crop_drag_mode:
+            return
+
+        source_x, source_y = self._canvas_to_source(event.x, event.y)
+        if self.crop_drag_mode == "move":
+            start_x, start_y = self.crop_drag_start
+            dx = source_x - start_x
+            dy = source_y - start_y
+            self.crop_rect = self._move_crop_rect(self.crop_drag_rect, dx, dy)
+        elif self.crop_drag_mode in {"nw", "ne", "sw", "se"}:
+            self.crop_rect = self._resize_crop_rect(self.crop_drag_rect, self.crop_drag_mode, source_x, source_y)
+        self._draw_crop_canvas()
+
+    def _crop_release(self, event: tk.Event) -> None:
+        self.crop_drag_mode = None
+        self.crop_drag_rect = None
+
+    def _crop_hit_test(self, x: float, y: float) -> str | None:
+        if self.crop_rect is None:
+            return None
+
+        left, top, right, bottom = self._source_rect_to_canvas(self.crop_rect)
+        handles = {
+            "nw": (left, top),
+            "ne": (right, top),
+            "sw": (left, bottom),
+            "se": (right, bottom),
+        }
+        for name, (handle_x, handle_y) in handles.items():
+            if abs(x - handle_x) <= 10 and abs(y - handle_y) <= 10:
+                return name
+        if left <= x <= right and top <= y <= bottom:
+            return "move"
+        return None
+
+    def _move_crop_rect(self, rect: tuple[float, float, float, float], dx: float, dy: float) -> tuple[float, float, float, float]:
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
+        left = max(0.0, min(float(self.crop_source_image.width) - width, left + dx))
+        top = max(0.0, min(float(self.crop_source_image.height) - height, top + dy))
+        return (left, top, left + width, top + height)
+
+    def _resize_crop_rect(
+        self,
+        rect: tuple[float, float, float, float],
+        handle: str,
+        pointer_x: float,
+        pointer_y: float,
+    ) -> tuple[float, float, float, float]:
+        left, top, right, bottom = rect
+        anchor_x = right if "w" in handle else left
+        anchor_y = bottom if "n" in handle else top
+        sign_x = -1 if "w" in handle else 1
+        sign_y = -1 if "n" in handle else 1
+        max_width = anchor_x if sign_x < 0 else self.crop_source_image.width - anchor_x
+        max_height = anchor_y if sign_y < 0 else self.crop_source_image.height - anchor_y
+        width_from_x = abs(pointer_x - anchor_x)
+        width_from_y = abs(pointer_y - anchor_y) * TARGET_ASPECT_RATIO
+        width = max(width_from_x, width_from_y, 24.0)
+        width = min(width, max_width, max_height * TARGET_ASPECT_RATIO)
+        height = width / TARGET_ASPECT_RATIO
+
+        new_left = anchor_x if sign_x > 0 else anchor_x - width
+        new_right = anchor_x + width if sign_x > 0 else anchor_x
+        new_top = anchor_y if sign_y > 0 else anchor_y - height
+        new_bottom = anchor_y + height if sign_y > 0 else anchor_y
+        return (new_left, new_top, new_right, new_bottom)
 
     def _start_download(self) -> None:
         if self.worker and self.worker.is_alive():

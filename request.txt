@@ -1,0 +1,8 @@
+
+tu peux supprimer la colonne.
+Lors de la recherche je ne veux pas que tu cherches les cartes 1 par 1, mais je veux que tu fasse une recherche avec la partie bulk :
+https://api.scryfall.com/bulk-data
+
+Example Requests
+Fetch the “Oracle Cards” bulk data
+GET https://api.scryfall.com/bulk-data/oracle-cards

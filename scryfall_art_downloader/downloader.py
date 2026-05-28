@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from shutil import copyfileobj
+from shutil import copyfile, copyfileobj
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .models import CardImage, CardRequest, SetRequest
+from .models import CardImage, CardPrint, CardRequest, DecklistEntry, SetRequest
 from .scryfall_client import ScryfallClient, USER_AGENT
 
 
@@ -121,10 +121,86 @@ class ArtDownloader:
             on_progress(1, 1)
         return 1, target_dir
 
+    def download_decklist(
+        self,
+        selections: list[tuple[DecklistEntry, CardPrint]],
+        language: str,
+        image_size: str = "large",
+        overwrite: bool = False,
+        on_status: ProgressCallback | None = None,
+        on_progress: ProgressCountCallback | None = None,
+        should_cancel: CancelCallback | None = None,
+    ) -> tuple[int, Path]:
+        target_dir = self.output_root / f"DECKLIST_{language.upper()}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        total = sum(entry.quantity for entry, _card_print in selections)
+        count = 0
+
+        if on_status:
+            on_status(f"Dossier cible: {target_dir}")
+            on_status(f"Total images: {total}")
+            on_status(f"Format image: {image_size}")
+        if on_progress:
+            on_progress(0, total)
+
+        for position, (entry, card_print) in enumerate(selections, start=1):
+            card_print = card_print.for_image_size(image_size)
+            source_file: Path | None = None
+            for copy_index in range(1, entry.quantity + 1):
+                if should_cancel and should_cancel():
+                    if on_status:
+                        on_status("Annulé.")
+                    return count, target_dir
+
+                target = self._decklist_target_path(target_dir, position, entry, card_print, copy_index)
+                if target.exists() and not overwrite:
+                    count += 1
+                    source_file = target
+                    if on_status:
+                        on_status(f"Déjà présent: {target.name}")
+                    if on_progress:
+                        on_progress(count, total)
+                    continue
+
+                if source_file is not None and source_file.exists():
+                    if on_status:
+                        on_status(f"Copie: {target.name}")
+                    copyfile(source_file, target)
+                else:
+                    if on_status:
+                        on_status(f"Téléchargement: {target.name}")
+                    self._download_file(card_print.image_url, target)
+                    source_file = target
+
+                count += 1
+                if on_progress:
+                    on_progress(count, total)
+
+        return count, target_dir
+
     @staticmethod
     def _target_path(target_dir: Path, card: CardImage) -> Path:
         extension = Path(urlparse(card.image_url).path).suffix or ".jpg"
         return target_dir / f"{card.base_filename}{extension}"
+
+    @staticmethod
+    def _decklist_target_path(
+        target_dir: Path,
+        position: int,
+        entry: DecklistEntry,
+        card_print: CardPrint,
+        copy_index: int,
+    ) -> Path:
+        extension = Path(urlparse(card_print.image_url).path).suffix or ".jpg"
+        card_name = ArtDownloader._clean_filename_part(entry.name)
+        return target_dir / f"{position:03d}_{card_name}_{card_print.base_filename}_{copy_index:02d}{extension}"
+
+    @staticmethod
+    def _clean_filename_part(value: str) -> str:
+        cleaned = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in value)
+        while "__" in cleaned:
+            cleaned = cleaned.replace("__", "_")
+        return cleaned.strip("_") or "card"
 
     @staticmethod
     def _download_file(url: str, target: Path) -> None:

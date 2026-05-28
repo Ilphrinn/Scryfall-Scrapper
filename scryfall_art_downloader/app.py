@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import queue
+import hashlib
 import sys
 import threading
 import tkinter as tk
 from pathlib import Path
+from shutil import copyfileobj
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from .aspect_cropper import TARGET_ASPECT_RATIO, centered_crop_rect, crop_image_to_ratio
+from .decklist_parser import parse_decklist
 from .downloader import ArtDownloader
 from .dpi_upscaler import upscale_folder_dpi
+from .local_bulk_catalog import LocalBulkCatalog, find_local_bulk_file
 from .margin_creator import create_black_margins
-from .models import CardRequest, SetRequest
+from .models import CardPrint, CardRequest, DecklistEntry, SetRequest
+from .scryfall_client import ScryfallClient, USER_AGENT
 from .url_parser import parse_scryfall_url
 
 
@@ -40,9 +47,11 @@ class ScryfallArtApp(tk.Tk):
         self.trim_header_logo = self._load_logo_image(54, names=("logo_trim.ico", "logo.png"))
         self.iconphoto(True, self.taskbar_logo)
 
-        self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.cancel_event = threading.Event()
+        self.decklist_worker: threading.Thread | None = None
+        self.decklist_cancel_event = threading.Event()
         self.upscale_worker: threading.Thread | None = None
         self.upscale_cancel_event = threading.Event()
         self.margin_worker: threading.Thread | None = None
@@ -55,6 +64,14 @@ class ScryfallArtApp(tk.Tk):
         self.crop_drag_mode: str | None = None
         self.crop_drag_start = (0.0, 0.0)
         self.crop_drag_rect: tuple[float, float, float, float] | None = None
+        self.decklist_entries: list[DecklistEntry] = []
+        self.decklist_rows: list[dict[str, object]] = []
+        self.decklist_prints_by_index: dict[int, list[CardPrint]] = {}
+        self.decklist_selected_prints: dict[int, CardPrint] = {}
+        self.decklist_analyzed_language = ""
+        self.decklist_analyzed_image_size = ""
+        self.decklist_preview_images: dict[str, object] = {}
+        self.decklist_preview_lock = threading.Lock()
         self.is_fullscreen = False
         self.normal_geometry = "820x540"
         self.fullscreen_button: tk.Button | None = None
@@ -70,6 +87,10 @@ class ScryfallArtApp(tk.Tk):
         self.output_var = tk.StringVar(value="")
         self.image_size_var = tk.StringVar(value="large")
         self.overwrite_var = tk.BooleanVar(value=False)
+        self.decklist_language_var = tk.StringVar(value="fr")
+        self.decklist_output_var = tk.StringVar(value="")
+        self.decklist_image_size_var = tk.StringVar(value="large")
+        self.decklist_overwrite_var = tk.BooleanVar(value=False)
         self.upscale_folder_var = tk.StringVar(value="")
         self.upscale_output_var = tk.StringVar(value="")
         self.margin_folder_var = tk.StringVar(value="")
@@ -299,6 +320,17 @@ class ScryfallArtApp(tk.Tk):
         style.configure("TButton", background="#3b3b3b", foreground="#ffffff", borderwidth=1, focusthickness=0, padding=(12, 6))
         style.map("TButton", background=[("active", "#000000"), ("pressed", "#000000")])
         style.configure("Horizontal.TProgressbar", troughcolor="#2d2d2d", background="#8a8a8a", bordercolor="#202020")
+        style.configure(
+            "Treeview",
+            background="#181818",
+            fieldbackground="#181818",
+            foreground="#e8e8e8",
+            rowheight=24,
+            bordercolor="#3b3b3b",
+        )
+        style.map("Treeview", background=[("selected", "#000000")], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background="#2d2d2d", foreground="#ffffff", relief=tk.FLAT)
+        style.map("Treeview.Heading", background=[("active", "#000000")])
         self.option_add("*TCombobox*Listbox.background", "#181818")
         self.option_add("*TCombobox*Listbox.foreground", "#ffffff")
         self.option_add("*TCombobox*Listbox.selectBackground", "#000000")
@@ -341,15 +373,18 @@ class ScryfallArtApp(tk.Tk):
         resize_grip.bind("<B1-Motion>", self._resize_window)
 
         scraper_tab = ttk.Frame(notebook)
+        decklist_tab = ttk.Frame(notebook)
         upscaler_tab = ttk.Frame(notebook)
         margin_tab = ttk.Frame(notebook)
         crop_tab = ttk.Frame(notebook)
         notebook.add(scraper_tab, text="Scryfall Downloader")
+        notebook.add(decklist_tab, text="Decklist")
         notebook.add(upscaler_tab, text="DPI Upscaler")
         notebook.add(margin_tab, text="Margin Creator")
         notebook.add(crop_tab, text="Ratio Cropper")
 
         self._build_scraper_tab(scraper_tab)
+        self._build_decklist_tab(decklist_tab)
         self._build_upscaler_tab(upscaler_tab)
         self._build_margin_tab(margin_tab)
         self._build_crop_tab(crop_tab)
@@ -413,6 +448,120 @@ class ScryfallArtApp(tk.Tk):
 
         self.log = self._make_log_widget(root)
         self.log.grid(row=8, column=0, columnspan=3, sticky="nsew")
+
+    def _build_decklist_tab(self, root: ttk.Frame) -> None:
+        for row in range(8):
+            root.rowconfigure(row, weight=0)
+        root.columnconfigure(1, weight=1)
+        root.columnconfigure(3, weight=1)
+        root.rowconfigure(2, weight=3, minsize=120)
+        root.rowconfigure(5, weight=2, minsize=96)
+        root.rowconfigure(7, weight=1, minsize=48)
+
+        ttk.Label(root, text="Langue").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            root,
+            textvariable=self.decklist_language_var,
+            values=("en", "fr", "de", "es", "it", "pt", "ja", "ko", "ru", "zhs", "zht"),
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        ttk.Label(root, text="Dossier").grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Entry(root, textvariable=self.decklist_output_var).grid(row=0, column=3, sticky="ew", padx=(12, 8))
+        ttk.Button(root, text="Parcourir", command=self._choose_decklist_output).grid(row=0, column=4, sticky="ew")
+
+        ttk.Label(root, text="Taille image").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        decklist_image_size_combo = ttk.Combobox(
+            root,
+            textvariable=self.decklist_image_size_var,
+            values=("small", "normal", "large", "png", "art_crop", "border_crop"),
+            state="readonly",
+            width=16,
+        )
+        decklist_image_size_combo.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(8, 0))
+        decklist_image_size_combo.bind("<<ComboboxSelected>>", self._on_decklist_image_size_changed)
+
+        ttk.Checkbutton(root, text="Remplacer les fichiers déjà présents", variable=self.decklist_overwrite_var).grid(
+            row=1, column=3, sticky="w", padx=(12, 0), pady=(8, 0)
+        )
+
+        ttk.Label(root, text="Decklist brute").grid(row=2, column=0, sticky="nw", pady=(10, 0))
+
+        self.decklist_text = tk.Text(
+            root,
+            height=7,
+            wrap="word",
+            bg="#181818",
+            fg="#e8e8e8",
+            insertbackground="#ffffff",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#3b3b3b",
+            highlightcolor="#666666",
+        )
+        self.decklist_text.grid(row=2, column=1, columnspan=3, sticky="nsew", padx=(12, 0), pady=(10, 0))
+        decklist_scroll = ttk.Scrollbar(root, orient=tk.VERTICAL, command=self.decklist_text.yview)
+        decklist_scroll.grid(row=2, column=4, sticky="ns", pady=(10, 0))
+        self.decklist_text.configure(yscrollcommand=decklist_scroll.set)
+        self.decklist_text.bind("<Control-v>", self._paste_decklist_text)
+        self.decklist_text.bind("<Control-V>", self._paste_decklist_text)
+        self.decklist_text.bind("<Control-a>", self._select_all_decklist_text)
+        self.decklist_text.bind("<Control-A>", self._select_all_decklist_text)
+
+        self.decklist_analyze_button = ttk.Button(root, text="Analyser", command=self._start_decklist_analysis)
+        self.decklist_analyze_button.grid(row=3, column=1, sticky="w", padx=(12, 0), pady=(8, 0))
+        self.decklist_download_button = ttk.Button(
+            root, text="Télécharger", command=self._start_decklist_download, state="disabled"
+        )
+        self.decklist_download_button.grid(row=3, column=1, sticky="w", padx=(125, 0), pady=(8, 0))
+        self.decklist_cancel_button = ttk.Button(root, text="Annuler", command=self._cancel_decklist, state="disabled")
+        self.decklist_cancel_button.grid(row=3, column=1, sticky="w", padx=(255, 0), pady=(8, 0))
+
+        ttk.Label(root, text="Cartes").grid(row=4, column=0, sticky="w", pady=(8, 4))
+        button_frame = ttk.Frame(root)
+        button_frame.grid(row=4, column=1, columnspan=3, sticky="e", pady=(8, 4))
+
+        self.decklist_english_fallback_button = ttk.Button(
+            button_frame,
+            text="Forcer Anglais (Highres)",
+            command=self._force_english_highres,
+            state="disabled",
+        )
+        self.decklist_english_fallback_button.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.decklist_change_print_button = ttk.Button(
+            button_frame,
+            text="Changer édition",
+            command=self._choose_decklist_edition,
+            state="disabled",
+        )
+        self.decklist_change_print_button.pack(side=tk.RIGHT)
+
+        columns = ("qty", "name", "edition")
+        self.decklist_tree = ttk.Treeview(root, columns=columns, show="headings", height=7, selectmode="browse")
+        self.decklist_tree.tag_configure("lowres", foreground="#ff9800")
+        self.decklist_tree.heading("qty", text="Copie")
+        self.decklist_tree.heading("name", text="Carte")
+        self.decklist_tree.heading("edition", text="Edition")
+        self.decklist_tree.column("qty", width=60, anchor="center", stretch=False)
+        self.decklist_tree.column("name", width=210, stretch=True)
+        self.decklist_tree.column("edition", width=400, stretch=True)
+        self.decklist_tree.grid(row=5, column=0, columnspan=4, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(root, orient=tk.VERTICAL, command=self.decklist_tree.yview)
+        tree_scroll.grid(row=5, column=4, sticky="ns")
+        self.decklist_tree.configure(yscrollcommand=tree_scroll.set)
+        self.decklist_tree.bind("<<TreeviewSelect>>", self._on_decklist_row_selected)
+        self.decklist_tree.bind("<Double-1>", self._choose_decklist_edition)
+
+        self.decklist_progress = ttk.Progressbar(root, mode="determinate", maximum=100, value=0)
+        self.decklist_progress.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 4))
+        self.decklist_progress_label = ttk.Label(root, text="En attente", anchor="e")
+        self.decklist_progress_label.grid(row=6, column=4, sticky="ew", padx=(12, 0), pady=(8, 4))
+
+        self.decklist_log = self._make_log_widget(root)
+        self.decklist_log.configure(height=4)
+        self.decklist_log.grid(row=7, column=0, columnspan=5, sticky="nsew")
 
     def _build_upscaler_tab(self, root: ttk.Frame) -> None:
         root.columnconfigure(1, weight=1)
@@ -589,6 +738,33 @@ class ScryfallArtApp(tk.Tk):
         folder = filedialog.askdirectory(initialdir=self.output_var.get() or ".")
         if folder:
             self.output_var.set(folder)
+
+    def _choose_decklist_output(self) -> None:
+        folder = filedialog.askdirectory(initialdir=self.decklist_output_var.get() or ".")
+        if folder:
+            self.decklist_output_var.set(folder)
+
+    def _paste_decklist_text(self, event: tk.Event | None = None) -> str:
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+
+        try:
+            if self.decklist_text.tag_ranges(tk.SEL):
+                self.decklist_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            pass
+
+        self.decklist_text.insert(tk.INSERT, text)
+        self.decklist_text.focus_set()
+        return "break"
+
+    def _select_all_decklist_text(self, event: tk.Event | None = None) -> str:
+        self.decklist_text.tag_add(tk.SEL, "1.0", tk.END)
+        self.decklist_text.mark_set(tk.INSERT, "1.0")
+        self.decklist_text.see(tk.INSERT)
+        return "break"
 
     def _choose_upscale_folder(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.upscale_folder_var.get() or ".")
@@ -864,6 +1040,560 @@ class ScryfallArtApp(tk.Tk):
         new_bottom = anchor_y + height if sign_y > 0 else anchor_y
         return (new_left, new_top, new_right, new_bottom)
 
+    def _start_decklist_analysis(self) -> None:
+        if self.decklist_worker and self.decklist_worker.is_alive():
+            return
+
+        raw_decklist = self.decklist_text.get("1.0", tk.END)
+        entries, skipped = parse_decklist(raw_decklist)
+        if not entries:
+            messagebox.showerror("Decklist invalide", "Colle au moins une ligne au format: 1 Nom de carte")
+            return
+
+        self.decklist_entries = entries
+        self.decklist_rows.clear()
+        self.decklist_prints_by_index.clear()
+        self.decklist_selected_prints.clear()
+        self.decklist_analyzed_language = self.decklist_language_var.get().strip()
+        self.decklist_analyzed_image_size = self.decklist_image_size_var.get().strip()
+        self.decklist_tree.delete(*self.decklist_tree.get_children())
+        for entry_index, entry in enumerate(entries):
+            for copy_number in range(1, entry.quantity + 1):
+                row_index = len(self.decklist_rows)
+                copy_label = f"{copy_number}/{entry.quantity}" if entry.quantity > 1 else "1"
+                self.decklist_rows.append(
+                    {
+                        "entry_index": entry_index,
+                        "copy_number": copy_number,
+                        "entry": entry,
+                    }
+                )
+                self.decklist_tree.insert("", tk.END, iid=str(row_index), values=(copy_label, entry.name, "Recherche..."))
+
+        self._clear_decklist_log()
+        if skipped:
+            self._decklist_log(f"Lignes ignorees: {len(skipped)}")
+            for line in skipped[:5]:
+                self._decklist_log(f"  {line}")
+            if len(skipped) > 5:
+                self._decklist_log("  ...")
+
+        self.decklist_analyze_button.configure(state="disabled")
+        self.decklist_download_button.configure(state="disabled")
+        self.decklist_cancel_button.configure(state="normal")
+        self.decklist_change_print_button.configure(state="disabled")
+        self.decklist_english_fallback_button.configure(state="disabled")
+        self.decklist_cancel_event.clear()
+        self.decklist_progress.configure(maximum=100, value=0)
+        self.decklist_progress_label.configure(text="Démarrage...")
+
+        self.decklist_worker = threading.Thread(
+            target=self._run_decklist_analysis,
+            args=(entries, self.decklist_analyzed_language, self.decklist_analyzed_image_size),
+            daemon=True,
+        )
+        self.decklist_worker.start()
+
+    def _run_decklist_analysis(self, entries: list[DecklistEntry], language: str, image_size: str) -> None:
+        try:
+            local_bulk_file = self._find_local_bulk_file()
+            if local_bulk_file is None:
+                self.messages.put(("decklist_log", "Aucun fichier bulk local trouvé (all-cards / oracle-cards)."))
+                self.messages.put(("decklist_log", "Récupération du bulk Oracle Cards depuis Scryfall..."))
+                req = Request("https://api.scryfall.com/bulk-data/oracle-cards", headers={"User-Agent": USER_AGENT})
+                with urlopen(req, timeout=30) as response:
+                    import json
+                    metadata = json.loads(response.read().decode("utf-8"))
+                download_uri = metadata["download_uri"]
+                filename = download_uri.split("/")[-1]
+                target_path = Path.cwd() / filename
+                self.messages.put(("decklist_log", f"Téléchargement de {filename}..."))
+                req_dl = Request(download_uri, headers={"User-Agent": USER_AGENT})
+                with urlopen(req_dl, timeout=60) as response:
+                    total_size = int(response.headers.get("content-length", 0))
+                    bytes_downloaded = 0
+                    temp_path = target_path.with_suffix(".json.tmp")
+                    with temp_path.open("wb") as out_file:
+                        while True:
+                            if self.decklist_cancel_event.is_set():
+                                raise RuntimeError("Téléchargement annulé.")
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            out_file.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            if total_size > 0:
+                                self.messages.put(("decklist_local_bulk_progress", f"{bytes_downloaded}/{total_size}"))
+                    temp_path.replace(target_path)
+                local_bulk_file = target_path
+                self.messages.put(("decklist_log", "Bulk téléchargé avec succès."))
+
+            prints_by_index: dict[int, list[CardPrint]] | None = None
+            if local_bulk_file is not None:
+                self.messages.put(("decklist_log", f"Bulk local trouvé: {local_bulk_file.name}"))
+                catalog = LocalBulkCatalog(
+                    bulk_file=local_bulk_file,
+                    on_status=lambda message: self.messages.put(("decklist_log", message)),
+                    on_progress=lambda current, total: self.messages.put(("decklist_local_bulk_progress", f"{current}/{total}")),
+                    should_cancel=self.decklist_cancel_event.is_set,
+                )
+                prints_by_index = catalog.search_deck_prints(entries, language, image_size)
+            else:
+                self.messages.put(("decklist_log", "Erreur lors de la récupération du bulk."))
+                client = ScryfallClient()
+
+            missing: list[str] = []
+            for index, entry in enumerate(entries):
+                if self.decklist_cancel_event.is_set():
+                    self.messages.put(("decklist_cancelled", "Analyse annulée."))
+                    return
+
+                self.messages.put(("decklist_log", f"Recherche: {entry.name}"))
+                if prints_by_index is not None:
+                    prints = prints_by_index.get(index, [])
+                else:
+                    prints = client.search_card_prints(
+                        entry.name,
+                        language,
+                        image_size,
+                        on_status=lambda message: self.messages.put(("decklist_log", message)),
+                    )
+                if not prints:
+                    missing.append(entry.name)
+                self.messages.put(("decklist_prints", (index, prints)))
+                self.messages.put(("decklist_progress", f"{index + 1}/{len(entries)}"))
+
+            if missing:
+                self.messages.put(("decklist_log", f"Introuvables en {language.upper()}: {', '.join(missing)}"))
+            self.messages.put(("decklist_analysis_done", "Analyse terminée."))
+        except Exception as error:
+            self.messages.put(("decklist_error", self._format_error(error)))
+
+    def _find_local_bulk_file(self) -> Path | None:
+        roots = [
+            Path.cwd(),
+            Path(__file__).resolve().parent.parent,
+        ]
+        if getattr(sys, "frozen", False):
+            roots.append(Path(sys.executable).resolve().parent)
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        if bundle_root:
+            roots.append(Path(bundle_root))
+
+        seen: set[Path] = set()
+        for root in roots:
+            try:
+                resolved = root.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            local_bulk_file = find_local_bulk_file(resolved)
+            if local_bulk_file is not None:
+                return local_bulk_file
+        return None
+
+    def _cancel_decklist(self) -> None:
+        if self.decklist_worker and self.decklist_worker.is_alive():
+            self.decklist_cancel_event.set()
+            self.decklist_cancel_button.configure(state="disabled")
+            self.decklist_progress_label.configure(text="Annulation...")
+            self._decklist_log("Annulation demandée...")
+
+    def _receive_decklist_prints(self, index: int, prints: list[CardPrint]) -> None:
+        image_size = self.decklist_image_size_var.get().strip()
+        prints = [card_print.for_image_size(image_size) for card_print in prints]
+        self.decklist_prints_by_index[index] = prints
+
+        row_indexes = [
+            row_index
+            for row_index, row in enumerate(self.decklist_rows)
+            if row.get("entry_index") == index
+        ]
+        if prints:
+            selected = prints[0]
+            for row_index in row_indexes:
+                self.decklist_selected_prints[row_index] = selected
+                edition_label = selected.label
+                if not selected.highres_image:
+                    edition_label = "⚠️ " + edition_label
+                self.decklist_tree.set(str(row_index), "edition", edition_label)
+                self.decklist_tree.item(str(row_index), tags=("lowres",) if not selected.highres_image else ())
+        else:
+            for row_index in row_indexes:
+                self.decklist_tree.set(str(row_index), "edition", "Introuvable")
+
+        selection = self.decklist_tree.selection()
+        if selection:
+            self._on_decklist_row_selected()
+
+    def _on_decklist_image_size_changed(self, event: tk.Event | None = None) -> None:
+        if not self.decklist_prints_by_index:
+            return
+        self._refresh_decklist_image_size()
+        self.decklist_analyzed_image_size = self.decklist_image_size_var.get().strip()
+        self._decklist_log(f"Taille image mise à jour localement: {self.decklist_analyzed_image_size}")
+
+    def _refresh_decklist_image_size(self) -> None:
+        image_size = self.decklist_image_size_var.get().strip()
+        self.decklist_prints_by_index = {
+            index: [card_print.for_image_size(image_size) for card_print in prints]
+            for index, prints in self.decklist_prints_by_index.items()
+        }
+        self.decklist_selected_prints = {
+            row_index: card_print.for_image_size(image_size)
+            for row_index, card_print in self.decklist_selected_prints.items()
+        }
+        for row_index, card_print in self.decklist_selected_prints.items():
+            edition_label = card_print.label
+            if not card_print.highres_image:
+                edition_label = "⚠️ " + edition_label
+            self.decklist_tree.set(str(row_index), "edition", edition_label)
+            self.decklist_tree.item(str(row_index), tags=("lowres",) if not card_print.highres_image else ())
+
+    def _on_decklist_row_selected(self, event: tk.Event | None = None) -> None:
+        selection = self.decklist_tree.selection()
+        if not selection:
+            self.decklist_change_print_button.configure(state="disabled")
+            self.decklist_english_fallback_button.configure(state="disabled")
+            return
+
+        row_index = int(selection[0])
+        if row_index >= len(self.decklist_rows):
+            self.decklist_change_print_button.configure(state="disabled")
+            self.decklist_english_fallback_button.configure(state="disabled")
+            return
+
+        entry_index = int(self.decklist_rows[row_index]["entry_index"])
+        prints = self.decklist_prints_by_index.get(entry_index)
+        state = "normal" if prints else "disabled"
+        self.decklist_change_print_button.configure(state=state)
+
+        # Enable English fallback button if selected print is lowres AND there is an English alternative
+        selected_print = self.decklist_selected_prints.get(row_index)
+        has_english = prints and any(p.language.lower() == "en" for p in prints)
+        if selected_print and not selected_print.highres_image and has_english:
+            self.decklist_english_fallback_button.configure(state="normal")
+        else:
+            self.decklist_english_fallback_button.configure(state="disabled")
+
+    def _force_english_highres(self) -> None:
+        selection = self.decklist_tree.selection()
+        if not selection:
+            return
+
+        row_index = int(selection[0])
+        if row_index >= len(self.decklist_rows):
+            return
+
+        row = self.decklist_rows[row_index]
+        entry_index = int(row["entry_index"])
+        prints = self.decklist_prints_by_index.get(entry_index, [])
+        if not prints:
+            return
+
+        # Find first English print that has highres_image = True
+        english_highres = None
+        for p in prints:
+            if p.language.lower() == "en" and p.highres_image:
+                english_highres = p
+                break
+
+        # Fallback to any English print if no highres one is found
+        if english_highres is None:
+            for p in prints:
+                if p.language.lower() == "en":
+                    english_highres = p
+                    break
+
+        if english_highres is not None:
+            self._apply_decklist_print(row_index, english_highres, batch=True)
+            self._on_decklist_row_selected()
+            self._decklist_log(f"Carte basculée en anglais (Highres) : {english_highres.name} ({english_highres.set_code.upper()})")
+        else:
+            messagebox.showinfo("Non disponible", "Aucune version anglaise trouvée pour cette carte.")
+
+    def _choose_decklist_edition(self, event: tk.Event | None = None) -> str | None:
+        if event is not None and getattr(event, "widget", None) is self.decklist_tree:
+            row_id = self.decklist_tree.identify_row(event.y)
+            if row_id:
+                self.decklist_tree.selection_set(row_id)
+                self.decklist_tree.focus(row_id)
+            else:
+                return "break"
+
+        selection = self.decklist_tree.selection()
+        if not selection:
+            return None
+
+        row_index = int(selection[0])
+        if row_index >= len(self.decklist_rows):
+            return None
+
+        row = self.decklist_rows[row_index]
+        entry_index = int(row["entry_index"])
+        copy_number = int(row["copy_number"])
+        entry = row["entry"]
+        if not isinstance(entry, DecklistEntry):
+            return None
+
+        prints = self.decklist_prints_by_index.get(entry_index, [])
+        if not prints:
+            return None
+
+        title = f"Editions - {entry.name}"
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.configure(bg="#202020")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("1040x680")
+        dialog.minsize(880, 600)
+
+        content = ttk.Frame(dialog)
+        content.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        content.columnconfigure(0, weight=1, minsize=440)
+        content.columnconfigure(2, weight=0, minsize=370)
+        content.rowconfigure(0, weight=1)
+
+        listbox = tk.Listbox(
+            content,
+            bg="#181818",
+            fg="#e8e8e8",
+            selectbackground="#000000",
+            selectforeground="#ffffff",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#3b3b3b",
+            highlightcolor="#666666",
+            activestyle="none",
+        )
+        listbox.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(content, orient=tk.VERTICAL, command=listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 12))
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        preview_panel = tk.Frame(content, bg="#202020", width=370, height=525)
+        preview_panel.grid(row=0, column=2, sticky="nsew")
+        preview_panel.grid_propagate(False)
+        preview_label = tk.Label(
+            preview_panel,
+            text="Preview",
+            bg="#181818",
+            fg="#bdbdbd",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#3b3b3b",
+        )
+        preview_label.place(relx=0.5, rely=0.5, anchor="center", width=360, height=510)
+
+        selected_print = self.decklist_selected_prints.get(row_index)
+        selected_position = 0
+        for position, card_print in enumerate(prints):
+            listbox.insert(tk.END, card_print.label)
+            if selected_print and card_print.id == selected_print.id:
+                selected_position = position
+        listbox.selection_set(selected_position)
+        listbox.activate(selected_position)
+        listbox.see(selected_position)
+
+        preview_token = {"value": 0}
+
+        def update_preview(event: tk.Event | None = None) -> None:
+            current = listbox.curselection()
+            if not current:
+                return
+            preview_token["value"] += 1
+            token = preview_token["value"]
+            preview_label.configure(image="", text="Chargement...")
+            self._load_decklist_preview(prints[current[0]], preview_label, dialog, token, preview_token)
+
+        listbox.bind("<<ListboxSelect>>", update_preview)
+        update_preview()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        def apply_selection() -> None:
+            current = listbox.curselection()
+            if not current:
+                return
+            self._apply_decklist_print(row_index, prints[current[0]], batch=False)
+            dialog.destroy()
+
+        def apply_batch_selection() -> None:
+            current = listbox.curselection()
+            if not current:
+                return
+            self._apply_decklist_print(row_index, prints[current[0]], batch=True)
+            dialog.destroy()
+
+        ttk.Button(buttons, text=f"Choisir copie {copy_number}", command=apply_selection).pack(side=tk.RIGHT, padx=(8, 0))
+        if entry.quantity > 1:
+            ttk.Button(buttons, text="Choisir toutes les copies", command=apply_batch_selection).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(buttons, text="Annuler", command=dialog.destroy).pack(side=tk.RIGHT)
+        listbox.bind("<Double-1>", lambda _event: apply_selection())
+        dialog.bind("<Return>", lambda _event: apply_selection())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        listbox.focus_set()
+        return "break"
+
+    def _load_decklist_preview(
+        self,
+        card_print: CardPrint,
+        preview_label: tk.Label,
+        dialog: tk.Toplevel,
+        token: int,
+        preview_token: dict[str, int],
+    ) -> None:
+        def worker() -> None:
+            try:
+                path = self._ensure_decklist_preview_file(card_print)
+            except Exception:
+                self.after(0, lambda: self._show_decklist_preview_error(preview_label, dialog, token, preview_token))
+                return
+
+            self.after(0, lambda: self._show_decklist_preview(path, card_print, preview_label, dialog, token, preview_token))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_decklist_preview_error(
+        self,
+        preview_label: tk.Label,
+        dialog: tk.Toplevel,
+        token: int,
+        preview_token: dict[str, int],
+    ) -> None:
+        if preview_token["value"] != token or not dialog.winfo_exists():
+            return
+        preview_label.configure(image="", text="Preview indisponible")
+
+    def _show_decklist_preview(
+        self,
+        path: Path,
+        card_print: CardPrint,
+        preview_label: tk.Label,
+        dialog: tk.Toplevel,
+        token: int,
+        preview_token: dict[str, int],
+    ) -> None:
+        if preview_token["value"] != token or not dialog.winfo_exists():
+            return
+
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(path) as source:
+                image = source.convert("RGBA")
+                image.thumbnail((350, 500), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
+        except Exception:
+            preview_label.configure(image="", text="Preview indisponible")
+            return
+
+        self.decklist_preview_images[card_print.id] = photo
+        preview_label.configure(image=photo, text="")
+
+    def _ensure_decklist_preview_file(self, card_print: CardPrint) -> Path:
+        url = card_print.preview_url or card_print.image_url
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+        extension = Path(urlparse(url).path).suffix or ".jpg"
+        cache_dir = Path.home() / ".scryfall_art_downloader" / "preview_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"{digest}{extension}"
+        with self.decklist_preview_lock:
+            if target.exists():
+                return target
+
+            temp_target = target.with_suffix(f"{target.suffix}.tmp")
+            request = Request(url, headers={"User-Agent": USER_AGENT})
+            with urlopen(request, timeout=30) as response:
+                with temp_target.open("wb") as output:
+                    copyfileobj(response, output)
+            temp_target.replace(target)
+        return target
+
+    def _apply_decklist_print(self, row_index: int, card_print: CardPrint, batch: bool = False) -> None:
+        if row_index >= len(self.decklist_rows):
+            return
+
+        target_indexes = [row_index]
+        if batch:
+            entry_index = self.decklist_rows[row_index]["entry_index"]
+            target_indexes = [
+                candidate_index
+                for candidate_index, row in enumerate(self.decklist_rows)
+                if row.get("entry_index") == entry_index
+            ]
+
+        for target_index in target_indexes:
+            sized_print = card_print.for_image_size(self.decklist_image_size_var.get().strip())
+            self.decklist_selected_prints[target_index] = sized_print
+            edition_label = sized_print.label
+            if not sized_print.highres_image:
+                edition_label = "⚠️ " + edition_label
+            self.decklist_tree.set(str(target_index), "edition", edition_label)
+            self.decklist_tree.item(str(target_index), tags=("lowres",) if not sized_print.highres_image else ())
+
+    def _start_decklist_download(self) -> None:
+        if self.decklist_worker and self.decklist_worker.is_alive():
+            return
+
+        if self.decklist_language_var.get().strip() != self.decklist_analyzed_language:
+            messagebox.showerror("Analyse à refaire", "La langue a changé. Relance l'analyse avant de télécharger.")
+            return
+
+        if self.decklist_image_size_var.get().strip() != self.decklist_analyzed_image_size:
+            self._refresh_decklist_image_size()
+            self.decklist_analyzed_image_size = self.decklist_image_size_var.get().strip()
+
+        missing = [
+            row["entry"].name
+            for row_index, row in enumerate(self.decklist_rows)
+            if isinstance(row.get("entry"), DecklistEntry) and row_index not in self.decklist_selected_prints
+        ]
+        if missing:
+            messagebox.showerror("Editions manquantes", "Aucune édition sélectionnée pour: " + ", ".join(missing[:8]))
+            return
+
+        selections = [
+            (DecklistEntry(quantity=1, name=row["entry"].name), self.decklist_selected_prints[row_index])
+            for row_index, row in enumerate(self.decklist_rows)
+            if isinstance(row.get("entry"), DecklistEntry)
+        ]
+
+        self.decklist_analyze_button.configure(state="disabled")
+        self.decklist_download_button.configure(state="disabled")
+        self.decklist_cancel_button.configure(state="normal")
+        self.decklist_cancel_event.clear()
+        self.decklist_progress.configure(maximum=len(selections), value=0)
+        self.decklist_progress_label.configure(text="Démarrage...")
+
+        image_size = self.decklist_image_size_var.get().strip() or "large"
+        self.decklist_worker = threading.Thread(target=self._run_decklist_download, args=(selections, image_size), daemon=True)
+        self.decklist_worker.start()
+
+    def _run_decklist_download(self, selections: list[tuple[DecklistEntry, CardPrint]], image_size: str) -> None:
+        try:
+            output_root = self.decklist_output_var.get().strip() or "ART"
+            downloader = ArtDownloader(output_root)
+            count, target_dir = downloader.download_decklist(
+                selections=selections,
+                language=self.decklist_analyzed_language,
+                image_size=image_size,
+                overwrite=self.decklist_overwrite_var.get(),
+                on_status=lambda message: self.messages.put(("decklist_log", message)),
+                on_progress=lambda current, total: self.messages.put(("decklist_progress", f"{current}/{total}")),
+                should_cancel=self.decklist_cancel_event.is_set,
+            )
+            if self.decklist_cancel_event.is_set():
+                self.messages.put(("decklist_cancelled", f"Annulé. {count} image(s) traitée(s) dans {target_dir}"))
+            else:
+                self.messages.put(("decklist_download_done", f"{count} image(s) dans {target_dir}"))
+        except Exception as error:
+            self.messages.put(("decklist_error", self._format_error(error)))
+
     def _start_download(self) -> None:
         if self.worker and self.worker.is_alive():
             return
@@ -1034,18 +1764,18 @@ class ScryfallArtApp(tk.Tk):
                 break
 
             if kind == "log":
-                self._log(message)
+                self._log(str(message))
             elif kind == "progress":
-                self._update_progress(self.progress, self.progress_label, message)
+                self._update_progress(self.progress, self.progress_label, str(message))
             elif kind == "done":
-                self._log(message)
+                self._log(str(message))
                 self._log("Fini !")
                 self.progress.configure(value=self.progress["maximum"])
                 self.progress_label.configure(text="Terminé")
                 self.start_button.configure(state="normal")
                 self.cancel_button.configure(state="disabled")
             elif kind == "cancelled":
-                self._log(message)
+                self._log(str(message))
                 self.progress_label.configure(text="Annulé")
                 self.start_button.configure(state="normal")
                 self.cancel_button.configure(state="disabled")
@@ -1054,20 +1784,58 @@ class ScryfallArtApp(tk.Tk):
                 self.progress_label.configure(text="Erreur")
                 self.start_button.configure(state="normal")
                 self.cancel_button.configure(state="disabled")
-                messagebox.showerror("Erreur", message)
+                messagebox.showerror("Erreur", str(message))
+            elif kind == "decklist_log":
+                self._decklist_log(str(message))
+            elif kind == "decklist_local_bulk_progress":
+                self._update_progress(self.decklist_progress, self.decklist_progress_label, str(message), prefix="Bulk local ")
+            elif kind == "decklist_progress":
+                self._update_progress(self.decklist_progress, self.decklist_progress_label, str(message))
+            elif kind == "decklist_prints":
+                index, prints = message
+                self._receive_decklist_prints(index, prints)
+            elif kind == "decklist_analysis_done":
+                self._decklist_log(str(message))
+                self.decklist_progress.configure(value=self.decklist_progress["maximum"])
+                self.decklist_progress_label.configure(text="Terminé")
+                self.decklist_analyze_button.configure(state="normal")
+                self.decklist_cancel_button.configure(state="disabled")
+                if len(self.decklist_selected_prints) == len(self.decklist_rows):
+                    self.decklist_download_button.configure(state="normal")
+            elif kind == "decklist_download_done":
+                self._decklist_log(str(message))
+                self._decklist_log("Fini !")
+                self.decklist_progress.configure(value=self.decklist_progress["maximum"])
+                self.decklist_progress_label.configure(text="Terminé")
+                self.decklist_analyze_button.configure(state="normal")
+                self.decklist_download_button.configure(state="normal")
+                self.decklist_cancel_button.configure(state="disabled")
+            elif kind == "decklist_cancelled":
+                self._decklist_log(str(message))
+                self.decklist_progress_label.configure(text="Annulé")
+                self.decklist_analyze_button.configure(state="normal")
+                self.decklist_download_button.configure(state="normal" if self.decklist_selected_prints else "disabled")
+                self.decklist_cancel_button.configure(state="disabled")
+            elif kind == "decklist_error":
+                self._decklist_log(f"Erreur: {message}")
+                self.decklist_progress_label.configure(text="Erreur")
+                self.decklist_analyze_button.configure(state="normal")
+                self.decklist_download_button.configure(state="normal" if self.decklist_selected_prints else "disabled")
+                self.decklist_cancel_button.configure(state="disabled")
+                messagebox.showerror("Erreur", str(message))
             elif kind == "upscale_log":
-                self._upscale_log(message)
+                self._upscale_log(str(message))
             elif kind == "upscale_progress":
-                self._update_progress(self.upscale_progress, self.upscale_progress_label, message)
+                self._update_progress(self.upscale_progress, self.upscale_progress_label, str(message))
             elif kind == "upscale_done":
-                self._upscale_log(message)
+                self._upscale_log(str(message))
                 self._upscale_log("Fini !")
                 self.upscale_progress.configure(value=self.upscale_progress["maximum"])
                 self.upscale_progress_label.configure(text="Terminé")
                 self.upscale_start_button.configure(state="normal")
                 self.upscale_cancel_button.configure(state="disabled")
             elif kind == "upscale_cancelled":
-                self._upscale_log(message)
+                self._upscale_log(str(message))
                 self.upscale_progress_label.configure(text="Annulé")
                 self.upscale_start_button.configure(state="normal")
                 self.upscale_cancel_button.configure(state="disabled")
@@ -1076,20 +1844,20 @@ class ScryfallArtApp(tk.Tk):
                 self.upscale_progress_label.configure(text="Erreur")
                 self.upscale_start_button.configure(state="normal")
                 self.upscale_cancel_button.configure(state="disabled")
-                messagebox.showerror("Erreur", message)
+                messagebox.showerror("Erreur", str(message))
             elif kind == "margin_log":
-                self._margin_log(message)
+                self._margin_log(str(message))
             elif kind == "margin_progress":
-                self._update_progress(self.margin_progress, self.margin_progress_label, message)
+                self._update_progress(self.margin_progress, self.margin_progress_label, str(message))
             elif kind == "margin_done":
-                self._margin_log(message)
+                self._margin_log(str(message))
                 self._margin_log("Fini !")
                 self.margin_progress.configure(value=self.margin_progress["maximum"])
                 self.margin_progress_label.configure(text="Terminé")
                 self.margin_start_button.configure(state="normal")
                 self.margin_cancel_button.configure(state="disabled")
             elif kind == "margin_cancelled":
-                self._margin_log(message)
+                self._margin_log(str(message))
                 self.margin_progress_label.configure(text="Annulé")
                 self.margin_start_button.configure(state="normal")
                 self.margin_cancel_button.configure(state="disabled")
@@ -1098,22 +1866,35 @@ class ScryfallArtApp(tk.Tk):
                 self.margin_progress_label.configure(text="Erreur")
                 self.margin_start_button.configure(state="normal")
                 self.margin_cancel_button.configure(state="disabled")
-                messagebox.showerror("Erreur", message)
+                messagebox.showerror("Erreur", str(message))
 
         self.after(100, self._poll_messages)
 
     @staticmethod
-    def _update_progress(progress: ttk.Progressbar, label: ttk.Label, message: str) -> None:
+    def _update_progress(progress: ttk.Progressbar, label: ttk.Label, message: str, prefix: str = "") -> None:
         current_text, total_text = message.split("/", 1)
         current = int(current_text)
         total = int(total_text)
         if total > 0:
             progress.configure(maximum=total, value=min(current, total))
             percent = int((current / total) * 100)
-            label.configure(text=f"{current} / {total} ({percent}%)")
+            label.configure(text=f"{prefix}{current} / {total} ({percent}%)")
+
+    @staticmethod
+    def _format_error(error: Exception) -> str:
+        message = str(error).strip()
+        return message or error.__class__.__name__
 
     def _log(self, message: str) -> None:
         self._append_log(self.log, message)
+
+    def _decklist_log(self, message: str) -> None:
+        self._append_log(self.decklist_log, message)
+
+    def _clear_decklist_log(self) -> None:
+        self.decklist_log.configure(state="normal")
+        self.decklist_log.delete("1.0", tk.END)
+        self.decklist_log.configure(state="disabled")
 
     def _upscale_log(self, message: str) -> None:
         self._append_log(self.upscale_log, message)

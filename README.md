@@ -111,7 +111,26 @@ Le bouton `Annuler` interrompt le telechargement entre deux images.
 
 ## DPI Upscaler
 
-Le deuxieme onglet permet de selectionner un dossier source et un dossier de sortie. Si le dossier de sortie est vide, l'application cree dans le dossier source:
+## Decklist Downloader
+
+Le deuxieme onglet permet de coller une decklist brute au format:
+
+```text
+1 Arcane Signet
+10 Island
+```
+
+Colle la liste avec `Ctrl+V`, choisis la langue et la taille d'image, puis lance `Analyser`. Si un fichier `all-cards-*.json` est present dans le dossier de l'application, il est utilise en priorite pour trouver les editions disponibles sans appeler `/cards/search` carte par carte.
+Au premier lancement avec ce fichier, l'application construit un index SQLite local dans `%USERPROFILE%\.scryfall_art_downloader\local_bulk_index`. Cette premiere indexation peut prendre du temps avec le fichier complet de Scryfall, mais les analyses suivantes interrogent directement l'index local et doivent etre beaucoup plus rapides.
+Sinon l'application cherche les impressions carte par carte avec l'API Scryfall, en limitant `/cards/search` et `/cards/named` a 2 requetes par seconde.
+Les recherches d'impressions sont mises en cache pendant 24 heures dans `%USERPROFILE%\.scryfall_art_downloader\api_cache\prints`.
+Apres une analyse, changer la taille d'image ne relance plus de recherche Scryfall: les editions gardent les URLs disponibles et la selection est mise a jour localement.
+Pour changer d'edition, double-clique sur une ligne de carte ou selectionne-la puis utilise `Changer edition`. Si une carte existe en plusieurs exemplaires, la fenetre permet d'appliquer l'edition a la copie choisie ou a toutes les copies de cette carte. Une preview est chargee depuis un cache local, sans nouvel appel API Scryfall.
+Le bouton `Telecharger` cree un dossier `DECKLIST_LANGUE` et genere autant de fichiers que la quantite indiquee dans la decklist.
+
+## DPI Upscaler
+
+Le troisieme onglet permet de selectionner un dossier source et un dossier de sortie. Si le dossier de sortie est vide, l'application cree dans le dossier source:
 
 ```text
 DPI_Upscale
@@ -122,7 +141,7 @@ Formats pris en charge: JPG, PNG, TIFF, BMP et WEBP.
 
 ## Margin Creator
 
-Le troisieme onglet permet de selectionner un dossier source et un dossier de sortie. Si le dossier de sortie est vide, l'application cree dans le dossier source:
+Le quatrieme onglet permet de selectionner un dossier source et un dossier de sortie. Si le dossier de sortie est vide, l'application cree dans le dossier source:
 
 ```text
 Margin_Creator
@@ -132,7 +151,7 @@ Chaque image compatible est normalisee en `3193x4457`, puis copiee avec une marg
 
 ## Ratio Cropper
 
-Le quatrieme onglet permet de selectionner une image puis de la recadrer au ratio `0.714:1`.
+Le cinquieme onglet permet de selectionner une image puis de la recadrer au ratio `0.714:1`.
 La selection est centree par defaut et peut etre deplacee ou redimensionnee avec les poignees blanches.
 Le ratio reste verrouille et le fichier final est obtenu uniquement par decoupe de l'image source, sans ajout de contenu.
 
@@ -147,6 +166,8 @@ Le ratio reste verrouille et le fichier final est obtenu uniquement par decoupe 
 - `build-linux-executable.sh`: generation de l'executable Linux.
 - `lancer-scryfall-downloader.sh`: lanceur Linux.
 - `scryfall_art_downloader/app.py`: interface graphique.
+- `scryfall_art_downloader/decklist_parser.py`: lecture des listes au format quantite + nom.
+- `scryfall_art_downloader/local_bulk_catalog.py`: index SQLite local d'un fichier `all-cards-*.json`.
 - `scryfall_art_downloader/aspect_cropper.py`: recadrage des images au ratio 0.714:1.
 - `scryfall_art_downloader/dpi_upscaler.py`: copie des images avec DPI 1200.
 - `scryfall_art_downloader/margin_creator.py`: creation de cadres noirs autour des images.

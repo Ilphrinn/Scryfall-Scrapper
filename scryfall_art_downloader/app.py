@@ -99,6 +99,7 @@ class ScryfallArtApp(tk.Tk):
         8. Démarrage du polling de messages
         """
         super().__init__()   # Appel du constructeur de tk.Tk (obligatoire)
+        self.withdraw()      # Cache la fenêtre immédiatement pour éviter le flash à (0,0)
 
         # --- Configuration de la fenêtre ---
         self.title("Scryfall Artwork Downloader")
@@ -202,7 +203,8 @@ class ScryfallArtApp(tk.Tk):
 
         # Onglet XML Generator
         self.xml_source_var = tk.StringVar(value="")                     # Dossier images recto
-        self.xml_output_var = tk.StringVar(value="")                     # Fichier XML de sortie
+        self.xml_output_var = tk.StringVar(value="")                     # Dossier de sortie de l'archive
+        self.xml_name_var = tk.StringVar(value="order")                  # Nom du projet (→ archive.zip + fichier.xml)
         self.xml_stock_var = tk.StringVar(value="(S30) Standard Smooth") # Stock papier sélectionné
         self.xml_foil_var = tk.BooleanVar(value=False)                   # Option foil (brillant)
 
@@ -225,8 +227,8 @@ class ScryfallArtApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close_application)   # Action sur fermeture de fenêtre
         self.bind("<Map>", self._restore_borderless)    # Restaure le mode sans-bords après minimisation
         self.bind("<Escape>", self._exit_fullscreen)    # Échap = sortie du plein écran
-        self.after(100, self._poll_messages)            # Démarre le polling des messages (toutes les ~50ms)
-        self.after(150, self._show_in_windows_taskbar)  # Affiche l'icône dans la barre des tâches Windows
+        self.after(100, self._poll_messages)   # Démarre le polling des messages (toutes les ~50ms)
+        self.after(0, self._initial_show)      # Affichage initial centré, sans flash
 
     def _center_window(self) -> None:
         self.update_idletasks()
@@ -475,11 +477,23 @@ class ScryfallArtApp(tk.Tk):
     #  GESTION DE LA FENÊTRE (déplacement, redimensionnement, plein écran)
     # ==========================================================================
 
+    def _initial_show(self) -> None:
+        """
+        Premier affichage de la fenêtre : configure le style taskbar puis révèle la fenêtre.
+
+        On configure le style Win32 (WS_EX_APPWINDOW) AVANT de montrer la fenêtre pour
+        la première fois. Ainsi Windows intègre directement la fenêtre dans la barre des
+        tâches sans avoir besoin d'un cycle withdraw/deiconify, ce qui élimine le flash.
+        """
+        self._ensure_windows_appwindow(refresh=False)
+        self.deiconify()
+
     def _show_in_windows_taskbar(self) -> None:
         """
         Force l'affichage de l'icône de l'application dans la barre des tâches Windows.
 
         Nécessaire car overrideredirect(True) cache normalement l'application de la barre.
+        Utilisé uniquement après une restauration depuis la barre des tâches.
         """
         self._ensure_windows_appwindow(refresh=True)
 
@@ -1110,7 +1124,7 @@ class ScryfallArtApp(tk.Tk):
             root (ttk.Frame) : Conteneur de l'onglet.
         """
         root.columnconfigure(1, weight=1)
-        root.rowconfigure(6, weight=1)
+        root.rowconfigure(7, weight=1)
 
         header = ttk.Frame(root, style="Header.TFrame", padding=12)
         header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
@@ -1122,7 +1136,7 @@ class ScryfallArtApp(tk.Tk):
         ttk.Label(header, text="XML Generator", style="HeaderTitle.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(
             header,
-            text="Dossier d'images → archive ZIP (images renommées + Cardback.jpg + order.xml).",
+            text="Dossier d'images → archive ZIP (images renommées + Cardback.jpg + <nom>.xml).",
             style="HeaderSub.TLabel",
         ).grid(row=1, column=1, sticky="w")
 
@@ -1130,13 +1144,16 @@ class ScryfallArtApp(tk.Tk):
         ttk.Entry(root, textvariable=self.xml_source_var).grid(row=1, column=1, sticky="ew", padx=(12, 8))
         ttk.Button(root, text="Parcourir", command=self._choose_xml_source).grid(row=1, column=2, sticky="ew")
 
-        ttk.Label(root, text="Archive de sortie").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(root, text="Dossier de sortie").grid(row=2, column=0, sticky="w", pady=(12, 0))
         ttk.Entry(root, textvariable=self.xml_output_var).grid(row=2, column=1, sticky="ew", padx=(12, 8), pady=(12, 0))
         ttk.Button(root, text="Parcourir", command=self._choose_xml_output).grid(row=2, column=2, sticky="ew", pady=(12, 0))
 
-        ttk.Label(root, text="Stock").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(root, text="Nom du projet").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(root, textvariable=self.xml_name_var).grid(row=3, column=1, sticky="ew", padx=(12, 8), pady=(12, 0))
+
+        ttk.Label(root, text="Stock").grid(row=4, column=0, sticky="w", pady=(12, 0))
         xml_options_frame = ttk.Frame(root)
-        xml_options_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(12, 0))
+        xml_options_frame.grid(row=4, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(12, 0))
 
         xml_stock_combo = ttk.Combobox(
             xml_options_frame,
@@ -1163,16 +1180,16 @@ class ScryfallArtApp(tk.Tk):
         self.xml_foil_button.pack(side=tk.LEFT)
 
         xml_gen_frame = ttk.Frame(root)
-        xml_gen_frame.grid(row=4, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(16, 0))
+        xml_gen_frame.grid(row=5, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(16, 0))
         self.xml_generate_button = ttk.Button(xml_gen_frame, text="Générer XML", command=self._start_xml_generation)
         self.xml_generate_button.pack(side=tk.LEFT)
 
         self.xml_progress = ttk.Progressbar(root, mode="indeterminate")
-        self.xml_progress.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+        self.xml_progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 4))
 
         self.xml_log = self._make_log_widget(root)
         self.xml_log.configure(height=6)
-        self.xml_log.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        self.xml_log.grid(row=7, column=0, columnspan=3, sticky="nsew")
 
     def _build_upscaler_tab(self, root: ttk.Frame) -> None:
         root.columnconfigure(1, weight=1)
@@ -1389,15 +1406,10 @@ class ScryfallArtApp(tk.Tk):
             self.xml_source_var.set(folder)
 
     def _choose_xml_output(self) -> None:
-        initial = self.xml_output_var.get().strip() or "order.zip"
-        filename = filedialog.asksaveasfilename(
-            initialfile=Path(initial).name or "order.zip",
-            initialdir=str(Path(initial).parent) if Path(initial).parent != Path(".") else ".",
-            defaultextension=".zip",
-            filetypes=(("Archive ZIP", "*.zip"), ("Tous les fichiers", "*.*")),
-        )
-        if filename:
-            self.xml_output_var.set(filename)
+        initial = self.xml_output_var.get().strip() or "."
+        folder = filedialog.askdirectory(initialdir=initial)
+        if folder:
+            self.xml_output_var.set(folder)
 
     def _toggle_xml_foil(self) -> None:
         """Bascule l'option Foil et met à jour le style du bouton."""
@@ -1454,12 +1466,13 @@ class ScryfallArtApp(tk.Tk):
             return
 
         source = self.xml_source_var.get().strip()
-        output = self.xml_output_var.get().strip()
+        output_dir = self.xml_output_var.get().strip()
+        name = self.xml_name_var.get().strip() or "order"
         if not source:
             messagebox.showerror("Dossier manquant", "Sélectionne le dossier contenant les images.")
             return
-        if not output:
-            messagebox.showerror("Archive manquante", "Indique le chemin de l'archive ZIP de sortie.")
+        if not output_dir:
+            messagebox.showerror("Dossier manquant", "Indique le dossier de sortie de l'archive ZIP.")
             return
 
         stock = self.xml_stock_var.get().strip()
@@ -1471,12 +1484,12 @@ class ScryfallArtApp(tk.Tk):
 
         self.xml_worker = threading.Thread(
             target=self._run_xml_generation,
-            args=(source, output, stock, foil),
+            args=(source, output_dir, name, stock, foil),
             daemon=True,
         )
         self.xml_worker.start()
 
-    def _run_xml_generation(self, source_folder: str, output_zip: str, stock: str, foil: bool) -> None:
+    def _run_xml_generation(self, source_folder: str, output_dir: str, name: str, stock: str, foil: bool) -> None:
         """
         Thread de travail : génère une archive ZIP contenant les images renommées + order.xml.
 
@@ -1510,12 +1523,13 @@ class ScryfallArtApp(tk.Tk):
         try:
             EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
             source = Path(source_folder)
-            output = Path(output_zip)
+            output = Path(output_dir) / f"{name}.zip"
 
-            # --- Scan des fichiers image ---
+            # --- Scan des fichiers image (Cardback.jpg exclu pour éviter le doublon) ---
             image_files = sorted(
                 f for f in source.iterdir()
                 if f.is_file() and f.suffix.lower() in EXTENSIONS
+                and f.name.lower() != "cardback.jpg"
             )
             if not image_files:
                 self.messages.put(("xml_error", "Aucune image trouvée dans le dossier source."))
@@ -1578,7 +1592,7 @@ class ScryfallArtApp(tk.Tk):
                 group_size = len(hash_slots[h])
 
                 card = SubElement(fronts_el, "card")
-                SubElement(card, "id").text = f"./{clean_id}"
+                SubElement(card, "id").text = f"./Artwork/{clean_id}"
                 SubElement(card, "sourceType").text = "Local File"
                 SubElement(card, "slots").text = slots_str
                 SubElement(card, "name").text = clean_name
@@ -1590,7 +1604,7 @@ class ScryfallArtApp(tk.Tk):
             all_slots = ",".join(str(i) for i in range(total_cards))
             backs_el = SubElement(order, "backs")
             back_el = SubElement(backs_el, "card")
-            SubElement(back_el, "id").text = f"./{self._xml_file_in_zip(cardback)}"
+            SubElement(back_el, "id").text = f"./Artwork/{self._xml_file_in_zip(cardback)}"
             SubElement(back_el, "sourceType").text = "Local File"
             SubElement(back_el, "slots").text = all_slots
             SubElement(back_el, "name").text = self._xml_clean_name(cardback)
@@ -1607,20 +1621,20 @@ class ScryfallArtApp(tk.Tk):
             # --- Création de l'archive ZIP (tout en mémoire, rien sur le disque sauf le .zip final) ---
             output.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as zf:
-                # 1. XML en premier dans l'archive
-                zf.writestr("order.xml", xml_bytes)
+                # 1. XML à la racine de l'archive
+                zf.writestr(f"{name}.xml", xml_bytes)
 
-                # 2. Images recto (une seule copie par image unique, renommée)
+                # 2. Images recto dans le sous-dossier Artwork/
                 seen_in_zip: set[str] = set()
                 for f in image_files:
                     h = file_hashes[f]
                     if h in seen_in_zip:
                         continue
                     seen_in_zip.add(h)
-                    zf.write(hash_canonical[h], arcname=self._xml_file_in_zip(hash_canonical[h]))
+                    zf.write(hash_canonical[h], arcname=f"Artwork/{self._xml_file_in_zip(hash_canonical[h])}")
 
-                # 3. Dos : Cardback.jpg
-                zf.write(cardback, arcname=self._xml_file_in_zip(cardback))
+                # 3. Dos : Cardback.jpg dans Artwork/
+                zf.write(cardback, arcname=f"Artwork/{self._xml_file_in_zip(cardback)}")
 
             unique_images = len(seen_hashes)
             grouped = total_cards - unique_images
@@ -1650,7 +1664,7 @@ class ScryfallArtApp(tk.Tk):
         Retourne :
             str : Nom propre avec extension .jpeg si .jpg, sinon extension inchangée.
         """
-        clean_stem = f.stem.replace("_", " ")
+        clean_stem = f.stem.replace("_", " ").replace("'", " ")
         suffix = ".jpeg" if f.suffix.lower() == ".jpg" else f.suffix
         return clean_stem + suffix
 
@@ -1662,7 +1676,7 @@ class ScryfallArtApp(tk.Tk):
         Identique à _xml_clean_name mais conserve l'extension originale (.jpg reste .jpg).
         C'est le nom référencé dans le champ <id> du XML.
         """
-        return f.stem.replace("_", " ") + f.suffix
+        return f.stem.replace("_", " ").replace("'", " ") + f.suffix
 
     @staticmethod
     def _xml_query_from_filename(f: Path) -> str:

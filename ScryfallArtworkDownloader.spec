@@ -16,8 +16,9 @@ use_windows_metadata = (
     and Path(manifest_path).exists()
     and Path(version_path).exists()
 )
+
 tcl_dir = python_root / "tcl" / "tcl8.6"
-tk_dir = python_root / "tcl" / "tk8.6"
+tk_dir  = python_root / "tcl" / "tk8.6"
 tk_binaries = [
     path
     for path in (
@@ -31,10 +32,11 @@ tk_datas = [
     (str(source), target)
     for source, target in (
         (tcl_dir, "tcl/tcl8.6"),
-        (tk_dir, "tcl/tk8.6"),
+        (tk_dir,  "tcl/tk8.6"),
     )
     if source.exists()
 ]
+
 exe_options = {}
 if use_windows_metadata:
     exe_options.update({"version": version_path, "manifest": manifest_path})
@@ -45,23 +47,45 @@ a = Analysis(
     pathex=[],
     binaries=[(str(path), ".") for path in tk_binaries],
     datas=[
-        ("assets/logo.png", "assets"),
-        ("assets/logo32.png", "assets"),
-        ("assets/logo.ico", "assets"),
-        ("assets/logo_upscale.ico", "assets"),
-        ("assets/logo_margin.ico", "assets"),
-        ("assets/logo_trim.ico", "assets"),
-        ("assets/logo_decklist.ico", "assets"),
-        ("assets/logo_XML.ico", "assets"),
-        ("assets/Cardback.jpg", "assets"),
+        ("assets/logo.png",          "assets"),
+        ("assets/logo32.png",         "assets"),
+        ("assets/logo.ico",           "assets"),
+        ("assets/logo_upscale.ico",   "assets"),
+        ("assets/logo_margin.ico",    "assets"),
+        ("assets/logo_trim.ico",      "assets"),
+        ("assets/logo_decklist.ico",  "assets"),
+        ("assets/logo_XML.ico",       "assets"),
+        ("assets/Cardback.jpg",       "assets"),
     ] + tk_datas,
-    hiddenimports=["PIL", "PIL.Image", "tkinter", "_tkinter"],
+    hiddenimports=[
+        # Tkinter
+        "tkinter", "_tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox",
+        # Pillow — modules de base
+        "PIL", "PIL.Image", "PIL.ImageTk", "PIL.ImageDraw", "PIL.ImageFilter", "PIL.ImageOps",
+        # Pillow — décodeurs de formats utilisés dans le projet
+        "PIL.JpegImagePlugin", "PIL.PngImagePlugin", "PIL.WebPImagePlugin",
+        "PIL.TiffImagePlugin", "PIL.BmpImagePlugin",
+        # Pillow — décodeurs internes nécessaires au runtime
+        "PIL._imaging", "PIL._tkinter_finder",
+    ],
+    excludes=[
+        # Modules scientifiques lourds non utilisés
+        "numpy", "scipy", "pandas", "matplotlib",
+        # Tests et outils de dev
+        "unittest", "test", "doctest", "pdb", "profile", "cProfile",
+        # Protocoles réseau non utilisés
+        "xmlrpc", "http.server", "ftplib", "imaplib", "smtplib", "poplib",
+        "email.mime",
+        # Concurrence non utilisée
+        "multiprocessing", "concurrent.futures", "asyncio",
+        # Divers non utilisés
+        "turtle", "curses", "audioop", "cgi", "cgitb",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
     noarchive=False,
-    optimize=0,
+    optimize=1,
 )
 pyz = PYZ(a.pure)
 

@@ -20,6 +20,10 @@ Thumbs.db
 # Résidus
 ProxyBack.jpg
 
+# Fichiers bulk Scryfall (trop volumineux pour git)
+all-cards-*.json
+oracle-cards-*.json
+
 # Dossiers générés par le programme
 DECKLIST_*/
 *_Marged/

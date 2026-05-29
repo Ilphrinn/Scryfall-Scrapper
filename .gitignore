@@ -16,3 +16,10 @@ Margin_Creator/
 
 .DS_Store
 Thumbs.db
+
+# Résidus
+ProxyBack.jpg
+
+# Dossiers générés par le programme
+DECKLIST_*/
+*_Marged/

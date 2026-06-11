@@ -76,6 +76,10 @@ SLOW_ENDPOINTS = (
 )
 # Ces endpoints sont plus lents à répondre → on leur applique un délai plus long.
 
+CANDIDATE_LANGUAGES = ("en", "fr", "de", "es", "it", "pt", "ja", "ko", "ru", "zhs", "zht")
+# Langues que l'on teste pour savoir lesquelles existent réellement dans un set.
+# Ce sont les langues "classiques" de Magic, dans l'ordre d'affichage préféré.
+
 
 # ---------------------------------------------------------------------------
 #  Classe principale ScryfallClient
@@ -120,10 +124,85 @@ class ScryfallClient:
                                     Par défaut : 0.1 seconde.
         """
         self.pause_seconds = pause_seconds   # Pause optionnelle entre chaque page de résultats
+        # Cache des langues disponibles par set (évite de re-sonder l'API à chaque saisie)
+        self._set_languages_cache: dict[str, list[str]] = {}
 
     # -----------------------------------------------------------------------
     #  Méthodes publiques
     # -----------------------------------------------------------------------
+
+    def available_languages_for_set(
+        self,
+        set_code: str,
+        on_status: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        """
+        Détermine quelles langues existent réellement pour un set donné.
+
+        OPTIMISATION : une seule requête au lieu d'une par langue.
+        On demande à Scryfall toutes les impressions du set, toutes langues
+        confondues (lang:any), triées par numéro de collecteur (order:set).
+        Comme une même carte (ex: la n°1) est imprimée dans chaque langue du set,
+        ces langues apparaissent toutes dès les premiers résultats : la première
+        page (175 cartes) suffit donc à les recenser. On lit cette page et on
+        collecte les langues distinctes.
+
+        Le résultat est mis en cache par code de set pour éviter de re-interroger
+        l'API à chaque fois que l'utilisateur revient sur le même lien.
+
+        Arguments :
+            set_code  (str)            : Code du set (ex: "rfin", "fin").
+            on_status (Callable|None)  : Callback de progression (messages texte).
+
+        Retourne :
+            list[str] : Langues disponibles, ordonnées (ex: ["ja"] pour rfin).
+                        Liste vide si le set est introuvable.
+        """
+        set_code = set_code.strip().lower()
+        if not set_code:
+            return []
+
+        # Réponse déjà connue → on la renvoie directement (pas de requête réseau)
+        if set_code in self._set_languages_cache:
+            return self._set_languages_cache[set_code]
+
+        if on_status:
+            on_status(f"Détection des langues du set {set_code.upper()}…")
+
+        params = urlencode(
+            {
+                "q": f"set:{set_code} lang:any",
+                "unique": "prints",
+                "order": "set",                  # Trie par numéro → regroupe les langues d'une même carte
+                "include_multilingual": "true",
+            }
+        )
+        url = f"{SCRYFALL_API}/cards/search?{params}"
+
+        try:
+            payload = self._get_json(url, on_status)
+        except RuntimeError as error:
+            if "HTTP 404" in str(error):
+                # Set introuvable / sans carte → aucune langue
+                self._set_languages_cache[set_code] = []
+                return []
+            raise
+
+        # Collecte des langues distinctes présentes sur la première page
+        found = {str(card["lang"]) for card in payload.get("data", []) if card.get("lang")}
+
+        ordered = self._order_languages(found)
+        self._set_languages_cache[set_code] = ordered
+        return ordered
+
+    @staticmethod
+    def _order_languages(langs: Iterable[str]) -> list[str]:
+        """
+        Ordonne les langues : les langues classiques d'abord (ordre de
+        CANDIDATE_LANGUAGES), puis toute langue inhabituelle par ordre alphabétique.
+        """
+        priority = {language: index for index, language in enumerate(CANDIDATE_LANGUAGES)}
+        return sorted(langs, key=lambda language: (priority.get(language, len(priority)), language))
 
     def iter_card_images(
         self,
@@ -148,8 +227,12 @@ class ScryfallClient:
             CardImage : Une image de carte à la fois.
         """
         # Construction de la requête de recherche Scryfall
-        # "set:FIN lang:fr" → toutes les cartes du set FIN en français
-        query = f"set:{set_request.set_code} lang:{set_request.language}"
+        # "set:FIN lang:fr"  → cartes du set FIN en français
+        # "set:RFIN lang:any" → cartes du set RFIN dans toutes les langues
+        # (langue vide ou "all" → on ne filtre pas sur une langue précise)
+        language = (set_request.language or "all").lower()
+        lang_filter = "any" if language == "all" else language
+        query = f"set:{set_request.set_code} lang:{lang_filter}"
         params = urlencode(
             {
                 "q": query,
@@ -161,12 +244,28 @@ class ScryfallClient:
         # URL de la première page de résultats
         next_url: str | None = f"{SCRYFALL_API}/cards/search?{params}"
 
-        # Boucle sur toutes les pages (Scryfall pagine les résultats à 175 cartes/page)
-        while next_url:
-            if on_status:
-                on_status(f"Lecture Scryfall: {next_url}")
+        # Libellé lisible de la langue pour les messages (ex: "EN", ou "toutes langues")
+        lang_label = "toutes langues" if lang_filter == "any" else lang_filter.upper()
+        page = 0   # Numéro de page en cours (Scryfall pagine les résultats à 175 cartes/page)
 
-            payload = self._get_json(next_url, on_status)
+        # Boucle sur toutes les pages
+        while next_url:
+            page += 1
+            if on_status:
+                on_status(f"Lecture du set {set_request.set_code.upper()} ({lang_label}), page {page}…")
+
+            try:
+                payload = self._get_json(next_url, on_status)
+            except RuntimeError as error:
+                # HTTP 404 = aucune carte ne correspond (ex: set inexistant, ou
+                # set sans carte dans la langue demandée). On donne un message clair.
+                if "HTTP 404" in str(error):
+                    raise RuntimeError(
+                        f"Aucune carte trouvée pour le set '{set_request.set_code}' "
+                        f"en langue '{lang_filter}'. Vérifiez le code du set ou "
+                        f"choisissez la langue « all » pour toutes les langues."
+                    ) from error
+                raise
 
             # On signale le total une seule fois (à la première page)
             if on_total and payload.get("total_cards"):
@@ -180,7 +279,9 @@ class ScryfallClient:
                     continue   # Carte sans image dans ce format → on passe
                 yield CardImage(
                     set_code=set_request.set_code,
-                    language=set_request.language,
+                    # Langue RÉELLE de la carte (importante quand on télécharge "all" :
+                    # évite les collisions de noms de fichiers entre langues).
+                    language=str(raw_card.get("lang") or set_request.language or ""),
                     collector_number=str(raw_card.get("collector_number", "")),
                     name=str(raw_card.get("name", "")),
                     image_url=image_url,

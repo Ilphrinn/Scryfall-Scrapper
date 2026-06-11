@@ -81,8 +81,13 @@ class ScryfallArtApp(tk.Tk):
     """
 
     # Textes d'exemple affichés dans les champs URL avant que l'utilisateur saisisse
-    URL_PLACEHOLDER = "https://scryfall.com/sets/SET/LANGUE"
+    # La langue dans le lien du set est optionnelle (sinon le menu "Langue" est utilisé).
+    URL_PLACEHOLDER = "https://scryfall.com/sets/SET"
     CARD_URL_PLACEHOLDER = "https://scryfall.com/card/SET/NUMERO/nom"
+
+    # Liste complète des langues proposées par défaut dans le menu du Downloader,
+    # avant qu'on ait détecté les langues réellement disponibles pour un set.
+    SCRAPER_LANGUAGE_VALUES = ("all", "en", "fr", "de", "es", "it", "pt", "ja", "ko", "ru", "zhs", "zht")
 
     def __init__(self) -> None:
         """
@@ -99,7 +104,11 @@ class ScryfallArtApp(tk.Tk):
         8. Démarrage du polling de messages
         """
         super().__init__()   # Appel du constructeur de tk.Tk (obligatoire)
-        self.withdraw()      # Cache la fenêtre immédiatement pour éviter le flash à (0,0)
+
+        # On cache la fenêtre immédiatement : elle restera invisible pendant toute
+        # la construction et le centrage, et ne sera affichée (deiconify) qu'une fois
+        # positionnée au centre. Évite le bref flash en haut à gauche de l'écran.
+        self.withdraw()
 
         # --- Configuration de la fenêtre ---
         self.title("Scryfall Artwork Downloader")
@@ -150,6 +159,11 @@ class ScryfallArtApp(tk.Tk):
         self.margin_cancel_event = threading.Event()              # Annulation du margin creator
         self.xml_worker: threading.Thread | None = None           # Thread pour la génération XML
 
+        # --- Détection des langues disponibles pour un set (onglet Downloader) ---
+        self.lang_detect_worker: threading.Thread | None = None   # Thread de détection des langues
+        self._lang_detect_set_code = ""                           # Dernier set dont on a détecté les langues
+        self.scraper_lang_client = ScryfallClient()               # Client dédié (avec cache) pour la détection
+
         # --- Variables d'état pour l'onglet Ratio Cropper ---
         self.crop_source_image = None             # Image Pillow chargée pour le recadrage
         self.crop_preview_image = None            # Image Tkinter pour l'aperçu (doit rester en mémoire)
@@ -192,6 +206,7 @@ class ScryfallArtApp(tk.Tk):
         self.card_url_var = tk.StringVar(value=self.CARD_URL_PLACEHOLDER) # Champ "Lien de carte"
         self.output_var = tk.StringVar(value="")                          # Champ "Dossier de sortie"
         self.image_size_var = tk.StringVar(value="large")                 # Sélecteur "Taille image"
+        self.scraper_language_var = tk.StringVar(value="")               # Langue du set (vide tant qu'on n'a pas cherché ; "" = toutes au téléchargement)
         self.overwrite_var = tk.BooleanVar(value=False)                   # Case "Remplacer les fichiers"
 
         # Onglet Decklist
@@ -227,16 +242,33 @@ class ScryfallArtApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close_application)   # Action sur fermeture de fenêtre
         self.bind("<Map>", self._restore_borderless)    # Restaure le mode sans-bords après minimisation
         self.bind("<Escape>", self._exit_fullscreen)    # Échap = sortie du plein écran
-        self.after(100, self._poll_messages)   # Démarre le polling des messages (toutes les ~50ms)
-        self.after(0, self._initial_show)      # Affichage initial centré, sans flash
+        self.after(100, self._poll_messages)            # Démarre le polling des messages (toutes les ~50ms)
+        # La fenêtre est encore cachée : on l'affiche centrée une fois la boucle
+        # d'événements démarrée (géométrie déjà appliquée pendant qu'elle est cachée).
+        self.after(0, self._present_window)
+        self.after(300, self._reassert_window_geometry)  # Re-verrouille la position centrée après le démarrage
 
     def _center_window(self) -> None:
         self.update_idletasks()
-        width = 820
+        # On centre selon la largeur réellement nécessaire (au minimum 820), car
+        # le contenu d'un onglet peut dépasser la largeur de base. Sans ça, la
+        # fenêtre s'élargit pour afficher tout son contenu mais reste positionnée
+        # comme si elle faisait 820 px → elle apparaît décalée.
+        width = max(820, self.winfo_reqwidth())
         height = 540
         x = (self.winfo_screenwidth() - width) // 2
         y = (self.winfo_screenheight() - height) // 2
-        self.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+        # On mémorise la géométrie centrée pour pouvoir la réappliquer : le cycle
+        # withdraw/deiconify (affichage dans la barre des tâches) réinitialise sinon
+        # la position d'une fenêtre sans bordure en haut à gauche de l'écran.
+        self._window_geometry = f"{width}x{height}+{max(x, 0)}+{max(y, 0)}"
+        self.geometry(self._window_geometry)
+
+    def _reassert_window_geometry(self) -> None:
+        """Réapplique la dernière géométrie centrée mémorisée (si elle existe)."""
+        geometry = getattr(self, "_window_geometry", "")
+        if geometry:
+            self.geometry(geometry)
 
     # ==========================================================================
     #  CHARGEMENT DES IMAGES / LOGOS
@@ -477,16 +509,21 @@ class ScryfallArtApp(tk.Tk):
     #  GESTION DE LA FENÊTRE (déplacement, redimensionnement, plein écran)
     # ==========================================================================
 
-    def _initial_show(self) -> None:
+    def _present_window(self) -> None:
         """
-        Premier affichage de la fenêtre : configure le style taskbar puis révèle la fenêtre.
+        Affiche la fenêtre pour la première fois, déjà centrée.
 
-        On configure le style Win32 (WS_EX_APPWINDOW) AVANT de montrer la fenêtre pour
-        la première fois. Ainsi Windows intègre directement la fenêtre dans la barre des
-        tâches sans avoir besoin d'un cycle withdraw/deiconify, ce qui élimine le flash.
+        La fenêtre a été cachée (withdraw) pendant toute la construction. Ici on
+        applique la géométrie centrée, on configure le style barre des tâches PENDANT
+        qu'elle est encore cachée, puis on la rend visible (deiconify) : sa première
+        apparition est donc directement au centre, sans flash en haut à gauche.
         """
-        self._ensure_windows_appwindow(refresh=False)
-        self.deiconify()
+        self._reassert_window_geometry()
+        self._ensure_windows_appwindow(refresh=False)   # Style barre des tâches (fenêtre encore cachée)
+        self.deiconify()                                 # Première apparition, déjà centrée
+        self._reassert_window_geometry()                 # Re-applique après le <Map>
+        # Confirme l'icône dans la barre des tâches une fois la fenêtre visible
+        self.after(60, self._ensure_windows_appwindow)
 
     def _show_in_windows_taskbar(self) -> None:
         """
@@ -544,11 +581,17 @@ class ScryfallArtApp(tk.Tk):
                 swp_nosize | swp_nomove | swp_nozorder | swp_noactivate | swp_framechanged,
             )
             if refresh and self.state() == "normal":
-                # Cycle caché/visible pour forcer l'apparition dans la barre des tâches
+                # Cycle caché/visible pour forcer l'apparition dans la barre des tâches.
+                # Ce cycle réinitialise la position → on recentre juste après le deiconify.
                 self.withdraw()
-                self.after(10, self.deiconify)
+                self.after(10, self._deiconify_and_recenter)
         except Exception:
             return   # Si l'API Windows échoue → on l'ignore silencieusement
+
+    def _deiconify_and_recenter(self) -> None:
+        """Réaffiche la fenêtre puis réapplique sa position centrée."""
+        self.deiconify()
+        self._reassert_window_geometry()
 
     def _restore_borderless(self, event: tk.Event | None = None) -> None:
         """
@@ -896,11 +939,41 @@ class ScryfallArtApp(tk.Tk):
         ttk.Label(header, text="Artwork par set, dossier par langue", style="HeaderSub.TLabel").grid(row=1, column=1, sticky="w")
 
         ttk.Label(root, text="Lien du set").grid(row=1, column=0, sticky="w")
-        self.url_entry = ttk.Entry(root, textvariable=self.url_var)
-        self.url_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(12, 0))
+        # Conteneur de la ligne du set : le champ URL à gauche (extensible) et la
+        # sélection de langue à droite, pour bien la distinguer du reste du formulaire.
+        set_row = ttk.Frame(root)
+        set_row.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(12, 0))
+        set_row.columnconfigure(0, weight=1)
+
+        self.url_entry = ttk.Entry(set_row, textvariable=self.url_var)
+        self.url_entry.grid(row=0, column=0, sticky="ew")
         self.url_entry.configure(foreground="#9a9a9a")
         self.url_entry.bind("<FocusIn>", self._clear_url_placeholder)
         self.url_entry.bind("<FocusOut>", self._restore_url_placeholder)
+        # Modifier le lien réinitialise (et regrise) le menu : les langues détectées
+        # ne correspondent plus forcément au nouveau set.
+        self.url_entry.bind("<KeyRelease>", self._on_set_url_edited)
+
+        # Sélection de langue : bouton "Rechercher" à gauche, menu (vide et grisé)
+        # à droite. Le menu reste vide et inactif tant qu'on n'a pas lancé la recherche.
+        language_frame = ttk.Frame(set_row)
+        language_frame.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Label(language_frame, text="Langue").pack(side=tk.LEFT, padx=(0, 6))
+        self.scraper_lang_button = ttk.Button(
+            language_frame,
+            text="Rechercher",
+            command=self._detect_set_languages,
+        )
+        self.scraper_lang_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.scraper_language_combo = ttk.Combobox(
+            language_frame,
+            textvariable=self.scraper_language_var,
+            values=(),          # Vide au départ : se remplit après la recherche
+            state="disabled",   # Grisé au départ : actif seulement après une recherche
+            width=7,
+        )
+        self.scraper_language_combo.pack(side=tk.LEFT)
+        self._bind_combobox_dropdown_top(self.scraper_language_combo)
 
         ttk.Label(root, text="Lien de carte").grid(row=2, column=0, sticky="w", pady=(12, 0))
         self.card_url_entry = ttk.Entry(root, textvariable=self.card_url_var)
@@ -1389,6 +1462,89 @@ class ScryfallArtApp(tk.Tk):
             self.card_url_entry.configure(foreground="#9a9a9a")
         else:
             self.card_url_entry.configure(foreground="#ffffff")
+
+    def _on_set_url_edited(self, event: tk.Event | None = None) -> None:
+        """
+        Regrise le menu de langue dès qu'on modifie le lien du set.
+
+        Les langues détectées valent pour un set précis : si le lien change,
+        elles ne sont plus fiables → on vide et on désactive le menu jusqu'à
+        une nouvelle recherche.
+        """
+        self._lang_detect_set_code = ""
+        self.scraper_language_var.set("")
+        self.scraper_language_combo.configure(values=(), state="disabled")
+
+    def _detect_set_languages(self, event: tk.Event | None = None) -> None:
+        """
+        Détecte les langues disponibles pour le set saisi (clic sur "Rechercher").
+
+        Lit le lien du set, l'analyse, puis interroge Scryfall dans un thread pour
+        ne proposer dans le menu déroulant que les langues réellement présentes.
+        Affiche un message si le lien est vide ou invalide.
+        """
+        if self.lang_detect_worker and self.lang_detect_worker.is_alive():
+            return   # Une détection est déjà en cours
+
+        raw = self.url_var.get().strip()
+        if not raw or raw == self.URL_PLACEHOLDER:
+            messagebox.showinfo("Lien manquant", "Saisis d'abord le lien du set dans le champ 'Lien du set'.")
+            return
+
+        try:
+            request = parse_scryfall_url(raw)
+        except ValueError as error:
+            messagebox.showerror("Lien invalide", str(error))
+            return
+
+        if not isinstance(request, SetRequest):
+            messagebox.showinfo(
+                "Lien de carte",
+                "Le menu de langue ne s'applique qu'aux liens de set (https://scryfall.com/sets/...).",
+            )
+            return
+
+        set_code = request.set_code
+        # Retour visuel : on désactive le bouton pendant la recherche
+        self.scraper_lang_button.configure(state="disabled", text="Recherche...")
+        self._log(f"Recherche des langues pour {set_code.upper()}...")
+
+        self.lang_detect_worker = threading.Thread(
+            target=self._run_lang_detection, args=(set_code,), daemon=True
+        )
+        self.lang_detect_worker.start()
+
+    def _run_lang_detection(self, set_code: str) -> None:
+        """Thread de travail : interroge Scryfall pour connaître les langues du set."""
+        try:
+            langs = self.scraper_lang_client.available_languages_for_set(
+                set_code,
+                on_status=lambda message: self.messages.put(("log", message)),
+            )
+            self.messages.put(("set_languages", (set_code, langs)))
+        except Exception as error:
+            # Échec non bloquant : on garde la liste actuelle et on le signale dans le log
+            self.messages.put(("log", f"Détection des langues impossible: {error}"))
+        finally:
+            # Toujours réactiver le bouton, succès comme échec
+            self.messages.put(("lang_detect_done", None))
+
+    def _apply_set_languages(self, set_code: str, langs: list[str]) -> None:
+        """Met à jour le menu déroulant avec les langues détectées pour le set."""
+        self._lang_detect_set_code = set_code
+        if langs:
+            values = ("all", *langs)
+            self._log(f"Langues disponibles pour {set_code.upper()}: {', '.join(langs)}")
+        else:
+            # Aucune langue candidate trouvée → on garde la liste complète par sécurité
+            values = self.SCRAPER_LANGUAGE_VALUES
+            self._log(f"Aucune langue détectée pour {set_code.upper()} — liste complète conservée.")
+        self.scraper_language_combo.configure(values=values)
+        # Si la langue actuellement sélectionnée n'existe plus, on retombe sur "all"
+        if self.scraper_language_var.get() not in values:
+            self.scraper_language_var.set("all")
+        # La recherche a abouti → le menu devient sélectionnable
+        self.scraper_language_combo.configure(state="readonly")
 
     def _choose_output(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.output_var.get() or ".")
@@ -3182,6 +3338,10 @@ class ScryfallArtApp(tk.Tk):
             request = parse_scryfall_url(set_url)
             if not isinstance(request, SetRequest):
                 raise ValueError("Le champ 'Lien du set' doit contenir un lien de set Scryfall.")
+            # Si le lien ne précise pas de langue, on utilise celle du menu déroulant.
+            # Une langue présente dans le lien (ex: .../sets/fin/fr) reste prioritaire.
+            if not request.language:
+                request = SetRequest(set_code=request.set_code, language=self.scraper_language_var.get())
             return request
 
         raise ValueError("Veuillez saisir un lien de set ou un lien de carte Scryfall.")
@@ -3360,6 +3520,11 @@ class ScryfallArtApp(tk.Tk):
 
             if kind == "log":
                 self._log(str(message))
+            elif kind == "set_languages":
+                set_code, langs = message
+                self._apply_set_languages(set_code, langs)
+            elif kind == "lang_detect_done":
+                self.scraper_lang_button.configure(state="normal", text="Rechercher langues")
             elif kind == "progress":
                 self._update_progress(self.progress, self.progress_label, str(message))
             elif kind == "done":

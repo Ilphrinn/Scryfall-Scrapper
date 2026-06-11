@@ -105,14 +105,15 @@ def parse_scryfall_url(value: str) -> ScryfallRequest:
     parts = [part for part in parsed.path.split("/") if part]
 
     # Détection du type d'URL selon le premier segment du chemin
-    if len(parts) >= 3 and parts[0].lower() == "sets":
+    # Un set accepte 2 segments (sans langue) ou 3 segments (avec langue).
+    if len(parts) >= 2 and parts[0].lower() == "sets":
         return _parse_set_parts(parts)
 
     if len(parts) >= 3 and parts[0].lower() == "card":
         return _parse_card_parts(parts)
 
     raise ValueError(
-        "Format attendu: https://scryfall.com/sets/fin/fr "
+        "Format attendu: https://scryfall.com/sets/fin (langue optionnelle: .../sets/fin/fr) "
         "ou https://scryfall.com/card/fic/7/yshtola-nights-blessed"
     )
 
@@ -121,27 +122,33 @@ def _parse_set_parts(parts: list[str]) -> SetRequest:
     """
     Construit un SetRequest depuis les segments du chemin d'une URL de set.
 
-    Le chemin d'une URL de set a exactement 3 segments :
-        ["sets", CODE_SET, LANGUE]
-    Exemple : ["sets", "fin", "fr"]
+    La langue est OPTIONNELLE dans l'URL. Le chemin peut avoir 2 ou 3 segments :
+        ["sets", CODE_SET]            → sans langue (ex: lien copié depuis Scryfall)
+        ["sets", CODE_SET, LANGUE]    → avec langue
+    Exemples : ["sets", "rfin"] ou ["sets", "fin", "fr"]
+
+    Quand la langue est absente, on laisse language vide ("") : l'appelant
+    (interface graphique) choisira alors la langue via son menu déroulant.
 
     Arguments :
         parts (list[str]) : Segments du chemin de l'URL (sans le premier "/").
 
     Retourne :
         SetRequest : Objet avec set_code et language normalisés en minuscules.
+                     language vaut "" si l'URL n'en précise pas.
 
     Lève :
-        ValueError : Si le nombre de segments est incorrect ou si un champ est vide.
+        ValueError : Si le nombre de segments est incorrect ou si le code set est vide.
     """
-    if len(parts) != 3:
-        raise ValueError("Format attendu: https://scryfall.com/sets/fin/fr")
+    if len(parts) not in (2, 3):
+        raise ValueError("Format attendu: https://scryfall.com/sets/fin (ou .../sets/fin/fr)")
 
     set_code = parts[1].strip().lower()    # Ex: "fin"
-    language = parts[2].strip().lower()   # Ex: "fr"
+    # Langue optionnelle : présente seulement si l'URL a 3 segments
+    language = parts[2].strip().lower() if len(parts) == 3 else ""
 
-    if not set_code or not language:
-        raise ValueError("Le code du set et la langue sont obligatoires.")
+    if not set_code:
+        raise ValueError("Le code du set est obligatoire.")
 
     return SetRequest(set_code=set_code, language=language)
 

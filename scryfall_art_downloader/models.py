@@ -41,8 +41,8 @@ class SetRequest:
         print(req.folder_name)  # Affiche : "FIN_FR"
     """
 
-    set_code: str   # Code court du set Scryfall (ex: "fin" pour Foundations)
-    language: str   # Langue souhaitée pour les cartes (ex: "fr", "en", "ja")
+    set_code: str          # Code court du set Scryfall (ex: "fin" pour Foundations)
+    language: str = "all"  # Langue souhaitée (ex: "fr", "en", "ja"). "all"/"" = toutes langues.
 
     @property
     def folder_name(self) -> str:
@@ -53,9 +53,13 @@ class SetRequest:
         (sans parenthèses) plutôt que comme une méthode.
 
         Retourne :
-            str : Nom du dossier, ex: "FIN_FR" pour le set "fin" en français.
+            str : Nom du dossier, ex: "FIN_FR" pour le set "fin" en français,
+                  ou "RFIN_ALL" quand on télécharge toutes les langues.
         """
-        return f"{self.set_code.upper()}_{self.language.upper()}"
+        # Langue vide ou "all" → suffixe "ALL" (téléchargement multilingue)
+        lang = (self.language or "all").lower()
+        suffix = "ALL" if lang == "all" else lang.upper()
+        return f"{self.set_code.upper()}_{suffix}"
 
 
 # ---------------------------------------------------------------------------

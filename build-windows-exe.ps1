@@ -123,7 +123,20 @@ if ($script:PyInstallerExitCode -ne 0) {
 
 Unblock-File -LiteralPath $exePath -ErrorAction SilentlyContinue
 
-$hash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash
+# Calcul du SHA256. Get-FileHash n'existe pas sur les vieilles versions de
+# PowerShell → on bascule sur l'API .NET (disponible partout) si besoin.
+if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+    $hash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash
+} else {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($exePath)
+    try {
+        $hash = [System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', ''
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
 $size = "{0:N1} Mo" -f ((Get-Item -LiteralPath $exePath).Length / 1MB)
 
 Write-Host ""

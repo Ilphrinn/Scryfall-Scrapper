@@ -49,6 +49,7 @@ from .aspect_cropper import TARGET_ASPECT_RATIO, centered_crop_rect, crop_image_
 from .decklist_parser import parse_decklist
 from .downloader import ArtDownloader
 from .dpi_upscaler import upscale_folder_dpi
+from .duplicate_finder import DuplicateGroup, find_duplicate_groups
 from .local_bulk_catalog import LOCAL_BULK_INDEX_DIR, LocalBulkCatalog, find_local_bulk_file
 from .margin_creator import create_black_margins
 from .models import CardPrint, CardRequest, DecklistEntry, SetRequest
@@ -138,6 +139,7 @@ class ScryfallArtApp(tk.Tk):
         self.upscale_header_logo = self._load_logo_image(54, names=("logo_upscale.ico", "logo.png"))     # En-tête onglet DPI
         self.margin_header_logo = self._load_logo_image(54, names=("logo_margin.ico", "logo.png"))       # En-tête onglet Margin
         self.trim_header_logo = self._load_logo_image(54, names=("logo_trim.ico", "logo.png"))           # En-tête onglet Crop
+        self.duplicates_header_logo = self._load_logo_image(54, names=("logo_duplicates.ico", "logo.png"))  # En-tête onglet Doublons
         self.iconphoto(True, self.taskbar_logo)   # Icône de la fenêtre dans la barre des tâches
 
         # --- File de messages (communication entre threads) ---
@@ -157,6 +159,8 @@ class ScryfallArtApp(tk.Tk):
         self.upscale_cancel_event = threading.Event()             # Annulation de l'upscaler
         self.margin_worker: threading.Thread | None = None        # Thread pour le Margin Creator
         self.margin_cancel_event = threading.Event()              # Annulation du margin creator
+        self.dup_worker: threading.Thread | None = None           # Thread pour la détection de doublons
+        self.dup_cancel_event = threading.Event()                 # Annulation de la détection de doublons
         self.xml_worker: threading.Thread | None = None           # Thread pour la génération XML
 
         # --- Détection des langues disponibles pour un set (onglet Downloader) ---
@@ -185,6 +189,20 @@ class ScryfallArtApp(tk.Tk):
         self._pending_state_restore: dict | None = None   # Sauvegarde à restaurer après analyse (chargement automatique)
         self.decklist_preview_images: dict[str, object] = {}   # Cache des images de prévisualisation (card_id → PhotoImage)
         self.decklist_preview_lock = threading.Lock()     # Verrou pour accès thread-safe au cache de prévisualisations
+
+        # --- Variables d'état pour l'onglet Doublons (détection de duplicatas) ---
+        self.dup_groups: list[DuplicateGroup] = []        # Groupes de doublons trouvés lors de la dernière analyse
+        self.dup_thumbnail_cache: dict[str, object] = {}  # Cache des miniatures par chemin (sinon Tkinter les libère ET re-décodage disque à chaque rendu)
+        self.dup_collapsed_group_ids: set[int] = set()    # id() des groupes repliés (en-tête seul, tuiles non construites) pour alléger l'affichage
+        self.dup_group_widgets: dict[int, dict] = {}       # id(groupe) -> {frame, toggle, tiles, index} pour replier/déplier sans tout reconstruire
+        # Niveaux de sensibilité → distance de Hamming maximale entre deux empreintes.
+        self.DUP_SENSITIVITY = {
+            "Identiques (0)": 0,
+            "Très proches (4)": 4,
+            "Proches — recommandé (8)": 8,
+            "Larges (12)": 12,
+            "Très larges (16)": 16,
+        }
 
         # --- Variables d'état pour la fenêtre ---
         self.is_fullscreen = False                # En mode plein écran ?
@@ -235,6 +253,12 @@ class ScryfallArtApp(tk.Tk):
         self.crop_image_var = tk.StringVar(value="")                     # Chemin de l'image source
         self.crop_output_var = tk.StringVar(value="")                    # Chemin du fichier de sortie
         self.crop_status_var = tk.StringVar(value="Choisis une image pour préparer le recadrage.")  # Message de statut
+
+        # Onglet Doublons
+        self.dup_folder_var = tk.StringVar(value="")                     # Dossier à analyser
+        self.dup_recursive_var = tk.BooleanVar(value=False)              # Inclure les sous-dossiers
+        self.dup_sensitivity_var = tk.StringVar(value="Proches — recommandé (8)")  # Niveau de sensibilité
+        self.dup_summary_var = tk.StringVar(value="Aucune analyse lancée.")        # Résumé sous la zone des groupes
 
         # --- Construction et finalisation ---
         self._build_ui()           # Construction de tous les widgets (barre de titre, onglets...)
@@ -719,12 +743,28 @@ class ScryfallArtApp(tk.Tk):
         """
         Réduit la fenêtre dans la barre des tâches.
 
-        On doit d'abord réactiver les bordures (overrideredirect=False) pour
-        que la minimisation fonctionne correctement, puis on les supprime
-        à nouveau quand la fenêtre est restaurée (via _restore_borderless).
+        Sous Windows, on minimise directement via l'API Win32 (ShowWindow) SANS
+        toucher à overrideredirect. Désactiver overrideredirect (ancienne méthode)
+        forçait Windows à recréer brièvement une fenêtre décorée standard → flash
+        blanc visible avant la réduction. En passant par ShowWindow, la fenêtre
+        garde son style personnalisé et se réduit proprement, sans flash.
         """
         if self.is_fullscreen:
             self._set_fullscreen(False)
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                # Handle de la fenêtre réellement présente dans la barre des tâches
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+                SW_MINIMIZE = 6   # Constante Win32 : réduire la fenêtre
+                ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
+                return
+            except Exception:
+                pass   # Si l'API échoue, on retombe sur la méthode générique ci-dessous
+
+        # Repli (non-Windows ou échec de l'API) : ancienne méthode avec bordures
         self.overrideredirect(False)   # Réactive les bords (nécessaire pour iconify)
         self.iconify()                 # Minimise dans la barre des tâches
         self.after(150, self._ensure_windows_appwindow)   # Maintient l'icône dans la barre
@@ -815,6 +855,12 @@ class ScryfallArtApp(tk.Tk):
         style.configure("Horizontal.TProgressbar", troughcolor="#2d2d2d", background="#8a8a8a", bordercolor="#202020")
         style.configure("FoilOn.TButton", background="#7a6000", foreground="#ffffff", borderwidth=1, focusthickness=0, padding=(12, 6))
         style.map("FoilOn.TButton", background=[("active", "#5a4600"), ("pressed", "#5a4600")], foreground=[("active", "#ffffff")])
+        # Bouton "Supprimer" de l'onglet Doublons (rouge).
+        style.configure("DupDelete.TButton", background="#8a2b2b", foreground="#ffffff", borderwidth=1, focusthickness=0, padding=(8, 4))
+        style.map("DupDelete.TButton", background=[("active", "#6f2222"), ("pressed", "#6f2222")], foreground=[("active", "#ffffff")])
+        # En-tête cliquable d'un groupe de doublons (replier/déplier) : texte aligné à gauche.
+        style.configure("DupHeader.TButton", background="#2f2f2f", foreground="#e6e6e6", borderwidth=1, focusthickness=0, padding=(10, 6), anchor="w")
+        style.map("DupHeader.TButton", background=[("active", "#3a3a3a"), ("pressed", "#3a3a3a")], foreground=[("active", "#ffffff")])
         style.configure(
             "Treeview",
             background="#181818",
@@ -887,12 +933,14 @@ class ScryfallArtApp(tk.Tk):
         upscaler_tab = ttk.Frame(notebook)
         margin_tab = ttk.Frame(notebook)
         crop_tab = ttk.Frame(notebook)
+        duplicates_tab = ttk.Frame(notebook)
         xml_tab = ttk.Frame(notebook)
         notebook.add(scraper_tab, text="Scryfall Downloader")
         notebook.add(decklist_tab, text="Decklist")
         notebook.add(upscaler_tab, text="DPI Upscaler")
         notebook.add(margin_tab, text="Margin Creator")
         notebook.add(crop_tab, text="Ratio Cropper")
+        notebook.add(duplicates_tab, text="Doublons")
         notebook.add(xml_tab, text="XML Generator")
 
         self._build_scraper_tab(scraper_tab)
@@ -900,6 +948,7 @@ class ScryfallArtApp(tk.Tk):
         self._build_upscaler_tab(upscaler_tab)
         self._build_margin_tab(margin_tab)
         self._build_crop_tab(crop_tab)
+        self._build_duplicates_tab(duplicates_tab)
         self._build_xml_tab(xml_tab)
 
     def _build_scraper_tab(self, root: ttk.Frame) -> None:
@@ -1257,7 +1306,10 @@ class ScryfallArtApp(tk.Tk):
         self.xml_generate_button = ttk.Button(xml_gen_frame, text="Générer XML", command=self._start_xml_generation)
         self.xml_generate_button.pack(side=tk.LEFT)
 
-        self.xml_progress = ttk.Progressbar(root, mode="indeterminate")
+        # Barre vide au repos (mode déterminé à 0). Elle ne passe en mode animé
+        # (indeterminate) que pendant la génération, sinon elle donne l'impression
+        # qu'un chargement est en cours alors que rien ne se passe.
+        self.xml_progress = ttk.Progressbar(root, mode="determinate", maximum=100, value=0)
         self.xml_progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 4))
 
         self.xml_log = self._make_log_widget(root)
@@ -1394,6 +1446,132 @@ class ScryfallArtApp(tk.Tk):
         self.crop_canvas.bind("<B1-Motion>", self._crop_drag)
         self.crop_canvas.bind("<ButtonRelease-1>", self._crop_release)
         self.crop_canvas.bind("<Configure>", lambda event: self._draw_crop_canvas())
+
+    def _build_duplicates_tab(self, root: ttk.Frame) -> None:
+        """
+        Construit l'onglet "Doublons" (détection de duplicatas par analyse d'image).
+
+        Cet onglet permet de :
+        - Analyser un dossier (et ses sous-dossiers en option) pour repérer les
+          images visuellement identiques ou très proches (même illustration en
+          plusieurs tailles/formats/compressions).
+        - Régler la sensibilité de détection.
+        - Pour chaque groupe de doublons, choisir image par image celle qu'on
+          garde (vert) et celle(s) qu'on supprime (rouge). Par défaut la plus
+          grande résolution est conservée.
+        - Supprimer définitivement les images marquées en rouge.
+
+        Layout (grille) :
+            Ligne 0 : En-tête (logo + titre)
+            Ligne 1 : Dossier à analyser + bouton Parcourir
+            Ligne 2 : Options (sous-dossiers, sensibilité)
+            Ligne 3 : Boutons (Analyser, Supprimer la sélection, Annuler)
+            Ligne 4 : Barre de progression + label
+            Ligne 5 : Résumé
+            Ligne 6 : Zone défilante des groupes de doublons (s'étire)
+            Ligne 7 : Zone de log
+
+        Arguments :
+            root (ttk.Frame) : Conteneur de l'onglet.
+        """
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(6, weight=1)
+
+        header = ttk.Frame(root, style="Header.TFrame", padding=12)
+        header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        header.columnconfigure(1, weight=1)
+
+        logo = tk.Label(header, image=self.duplicates_header_logo, bg="#242424")
+        logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
+
+        ttk.Label(header, text="Doublons", style="HeaderTitle.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(
+            header,
+            text="Repère les images identiques ou très proches et choisis lesquelles garder",
+            style="HeaderSub.TLabel",
+        ).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(root, text="Dossier à analyser").grid(row=1, column=0, sticky="w")
+        ttk.Entry(root, textvariable=self.dup_folder_var).grid(row=1, column=1, sticky="ew", padx=(12, 8))
+        ttk.Button(root, text="Parcourir", command=self._choose_dup_folder).grid(row=1, column=2, sticky="ew")
+
+        options_frame = ttk.Frame(root)
+        options_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ttk.Checkbutton(
+            options_frame,
+            text="Inclure les sous-dossiers",
+            variable=self.dup_recursive_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(options_frame, text="Sensibilité").pack(side=tk.LEFT, padx=(20, 6))
+        dup_sensitivity_combo = ttk.Combobox(
+            options_frame,
+            textvariable=self.dup_sensitivity_var,
+            values=tuple(self.DUP_SENSITIVITY.keys()),
+            state="readonly",
+            width=26,
+        )
+        dup_sensitivity_combo.pack(side=tk.LEFT)
+        self._bind_combobox_dropdown_top(dup_sensitivity_combo)
+
+        dup_btn_frame = ttk.Frame(root)
+        dup_btn_frame.grid(row=3, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        self.dup_analyze_button = ttk.Button(dup_btn_frame, text="Analyser", command=self._start_dup_analysis)
+        self.dup_analyze_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.dup_cancel_button = ttk.Button(dup_btn_frame, text="Annuler", command=self._cancel_dup, state="disabled")
+        self.dup_cancel_button.pack(side=tk.LEFT)
+        # Replie / déplie tous les groupes d'un coup (pour alléger une longue liste).
+        self.dup_collapse_all_button = ttk.Button(
+            dup_btn_frame,
+            text="Tout réduire",
+            command=self._toggle_all_dup_groups,
+            state="disabled",
+        )
+        self.dup_collapse_all_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.dup_progress = ttk.Progressbar(root, mode="determinate", maximum=100, value=0)
+        self.dup_progress.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 8))
+        self.dup_progress_label = ttk.Label(root, text="En attente", anchor="e")
+        self.dup_progress_label.grid(row=4, column=2, sticky="ew", padx=(12, 0), pady=(16, 8))
+
+        ttk.Label(root, textvariable=self.dup_summary_var).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        # --- Zone défilante contenant les groupes de doublons ---
+        groups_container = ttk.Frame(root)
+        groups_container.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        groups_container.rowconfigure(0, weight=1)
+        groups_container.columnconfigure(0, weight=1)
+
+        self.dup_canvas = tk.Canvas(
+            groups_container,
+            bg="#181818",
+            highlightthickness=1,
+            highlightbackground="#3b3b3b",
+            highlightcolor="#666666",
+        )
+        self.dup_canvas.grid(row=0, column=0, sticky="nsew")
+        dup_scroll = ttk.Scrollbar(groups_container, orient=tk.VERTICAL, command=self.dup_canvas.yview)
+        dup_scroll.grid(row=0, column=1, sticky="ns")
+        self.dup_canvas.configure(yscrollcommand=dup_scroll.set)
+
+        # Frame interne (réellement scrollé) placé dans le canvas via create_window.
+        self.dup_groups_frame = ttk.Frame(self.dup_canvas)
+        self.dup_groups_window = self.dup_canvas.create_window((0, 0), window=self.dup_groups_frame, anchor="nw")
+        # La zone défilable suit la taille du contenu ; la largeur du contenu suit le canvas.
+        self.dup_groups_frame.bind(
+            "<Configure>", lambda event: self.dup_canvas.configure(scrollregion=self.dup_canvas.bbox("all"))
+        )
+        self.dup_canvas.bind(
+            "<Configure>", lambda event: self.dup_canvas.itemconfigure(self.dup_groups_window, width=event.width)
+        )
+        # Molette de la souris : active seulement quand le curseur survole la zone.
+        self.dup_canvas.bind("<Enter>", lambda event: self.dup_canvas.bind_all("<MouseWheel>", self._on_dup_mousewheel))
+        self.dup_canvas.bind("<Leave>", lambda event: self.dup_canvas.unbind_all("<MouseWheel>"))
+
+        self.dup_log = self._make_log_widget(root)
+        self.dup_log.configure(height=5)
+        self.dup_log.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+
+        self._render_dup_groups()
 
     # ==========================================================================
     #  WIDGETS UTILITAIRES PARTAGÉS
@@ -3472,6 +3650,368 @@ class ScryfallArtApp(tk.Tk):
             self.messages.put(("margin_error", str(error)))
 
     # ==========================================================================
+    #  OPÉRATIONS DE L'ONGLET DOUBLONS (analyse, sélection, suppression)
+    # ==========================================================================
+
+    def _choose_dup_folder(self) -> None:
+        folder = filedialog.askdirectory(initialdir=self.dup_folder_var.get() or ".")
+        if folder:
+            self.dup_folder_var.set(folder)
+
+    def _on_dup_mousewheel(self, event: tk.Event) -> None:
+        """Fait défiler la zone des groupes avec la molette de la souris."""
+        # Sous Windows, event.delta est un multiple de 120 (un cran de molette).
+        self.dup_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _start_dup_analysis(self) -> None:
+        """Lance la détection de doublons dans un thread de travail séparé."""
+        if self.dup_worker and self.dup_worker.is_alive():
+            return
+
+        folder = self.dup_folder_var.get().strip()
+        if not folder:
+            messagebox.showerror("Dossier invalide", "Veuillez sélectionner un dossier à analyser.")
+            return
+        if not Path(folder).is_dir():
+            messagebox.showerror("Dossier invalide", "Le dossier sélectionné est introuvable.")
+            return
+
+        max_distance = self.DUP_SENSITIVITY.get(self.dup_sensitivity_var.get(), 8)
+        recursive = self.dup_recursive_var.get()
+
+        # Réinitialise l'affichage avant une nouvelle analyse.
+        self.dup_groups = []
+        self.dup_thumbnail_cache.clear()
+        self.dup_collapsed_group_ids.clear()
+        self._render_dup_groups()
+        self.dup_summary_var.set("Analyse en cours...")
+
+        self.dup_analyze_button.configure(state="disabled")
+        self.dup_cancel_button.configure(state="normal")
+        self.dup_cancel_event.clear()
+        self.dup_progress.configure(maximum=100, value=0)
+        self.dup_progress_label.configure(text="Démarrage...")
+        self._clear_dup_log()
+
+        self.dup_worker = threading.Thread(
+            target=self._run_dup_analysis, args=(folder, recursive, max_distance), daemon=True
+        )
+        self.dup_worker.start()
+
+    def _cancel_dup(self) -> None:
+        if self.dup_worker and self.dup_worker.is_alive():
+            self.dup_cancel_event.set()
+            self.dup_cancel_button.configure(state="disabled")
+            self.dup_progress_label.configure(text="Annulation...")
+            self._dup_log("Annulation demandée...")
+
+    def _run_dup_analysis(self, folder: str, recursive: bool, max_distance: int) -> None:
+        """Thread de travail : analyse le dossier et regroupe les doublons."""
+        try:
+            groups = find_duplicate_groups(
+                folder,
+                recursive=recursive,
+                max_distance=max_distance,
+                on_status=lambda message: self.messages.put(("dup_log", message)),
+                on_progress=lambda current, total: self.messages.put(("dup_progress", f"{current}/{total}")),
+                should_cancel=self.dup_cancel_event.is_set,
+            )
+            if self.dup_cancel_event.is_set():
+                self.messages.put(("dup_cancelled", "Analyse annulée."))
+            else:
+                self.messages.put(("dup_groups", groups))
+        except Exception as error:
+            self.messages.put(("dup_error", str(error)))
+
+    def _receive_dup_groups(self, groups: list[DuplicateGroup]) -> None:
+        """Enregistre les groupes de doublons reçus et reconstruit l'affichage."""
+        self.dup_groups = groups
+        self._render_dup_groups()
+
+    def _render_dup_groups(self, reset_scroll: bool = True) -> None:
+        """
+        (Re)construit l'affichage des groupes de doublons dans la zone défilante.
+
+        Chaque groupe a un en-tête cliquable (▼/▸) qui le replie ou le déplie.
+        Un groupe replié n'affiche que son en-tête : ses tuiles (et donc ses
+        miniatures) ne sont PAS construites. C'est essentiel pour la fluidité
+        quand il y a beaucoup de groupes — replier ce qu'on ne regarde pas
+        réduit fortement le nombre de widgets dans la zone défilante.
+
+        Arguments :
+            reset_scroll (bool) : True = remonter en haut de la liste (nouvelle
+                analyse). False = conserver la position de défilement actuelle
+                (après une suppression ou un repli global), pour ne pas perdre
+                sa place dans une longue liste.
+        """
+        # Mémorise la position de défilement avant de tout reconstruire.
+        previous_fraction = self.dup_canvas.yview()[0]
+
+        # On vide la zone (les miniatures restent en cache pour éviter de
+        # re-décoder toutes les images depuis le disque à chaque rendu).
+        for child in self.dup_groups_frame.winfo_children():
+            child.destroy()
+        self.dup_group_widgets.clear()
+
+        if not self.dup_groups:
+            ttk.Label(
+                self.dup_groups_frame,
+                text="Aucun doublon à afficher. Lance une analyse pour commencer.",
+                foreground="#9a9a9a",
+            ).pack(anchor="w", padx=12, pady=12)
+            self._update_dup_summary()
+            return
+
+        for group_index, group in enumerate(self.dup_groups):
+            self._build_dup_group(group, group_index)
+
+        # Restaure le défilement : en haut pour une nouvelle analyse, ou à la
+        # position précédente après une suppression/un repli. La scrollregion
+        # n'est mise à jour qu'au prochain cycle d'inactivité, d'où le after_idle.
+        if reset_scroll:
+            self.dup_canvas.yview_moveto(0)
+        else:
+            self.dup_canvas.after_idle(lambda: self.dup_canvas.yview_moveto(previous_fraction))
+        self._update_dup_summary()
+
+    def _build_dup_group(self, group: DuplicateGroup, group_index: int) -> None:
+        """
+        Construit un groupe : son en-tête repliable et (s'il est déplié) ses tuiles.
+
+        L'en-tête est un bouton plein-largeur qui sert aussi de titre : cliquer
+        dessus replie/déplie le groupe. Les références de widgets sont mémorisées
+        dans self.dup_group_widgets pour permettre un repli/dépli chirurgical
+        (sans reconstruire toute la liste).
+        """
+        collapsed = id(group) in self.dup_collapsed_group_ids
+
+        group_frame = ttk.LabelFrame(self.dup_groups_frame, padding=8)
+        group_frame.pack(fill=tk.X, expand=True, padx=10, pady=(8, 0))
+
+        indicator = "▸" if collapsed else "▼"
+        toggle = ttk.Button(
+            group_frame,
+            text=f"{indicator}  Groupe {group_index + 1} — {len(group.images)} images",
+            style="DupHeader.TButton",
+            command=lambda g=group: self._toggle_dup_group(g),
+        )
+        toggle.pack(fill=tk.X)
+
+        self.dup_group_widgets[id(group)] = {
+            "frame": group_frame,
+            "toggle": toggle,
+            "tiles": None,
+            "index": group_index,
+        }
+
+        if not collapsed:
+            self._build_dup_group_tiles(group)
+
+    def _build_dup_group_tiles(self, group: DuplicateGroup) -> None:
+        """
+        Construit la grille de tuiles (miniatures) d'un groupe déplié.
+
+        Appelée au rendu initial pour les groupes dépliés, et à la volée quand
+        l'utilisateur déplie un groupe. Idempotente : ne fait rien si les tuiles
+        existent déjà.
+        """
+        refs = self.dup_group_widgets.get(id(group))
+        if not refs or refs["tiles"] is not None:
+            return
+
+        tiles_frame = ttk.Frame(refs["frame"])
+        tiles_frame.pack(fill=tk.X, pady=(6, 0))
+        refs["tiles"] = tiles_frame
+
+        tiles_per_row = 4   # Au-delà, on passe à la ligne suivante dans le groupe.
+        for image_index, image in enumerate(group.images):
+            tile = ttk.Frame(tiles_frame, padding=6)
+            tile.grid(
+                row=image_index // tiles_per_row,
+                column=image_index % tiles_per_row,
+                sticky="n",
+                padx=4,
+                pady=4,
+            )
+
+            thumbnail = self._make_dup_thumbnail(image.path)
+            if thumbnail is not None:
+                thumb_label = tk.Label(tile, image=thumbnail, bg="#181818")
+            else:
+                thumb_label = tk.Label(
+                    tile, text="(aperçu\nindisponible)", bg="#181818", fg="#9a9a9a", width=14, height=6
+                )
+            thumb_label.pack()
+
+            ttk.Label(tile, text=self._truncate_middle(image.path.name, 24)).pack(anchor="w", pady=(4, 0))
+            ttk.Label(
+                tile,
+                text=f"{image.width}×{image.height} · {self._format_size(image.file_size)}",
+                foreground="#9a9a9a",
+            ).pack(anchor="w")
+
+            ttk.Button(
+                tile,
+                text="Supprimer",
+                style="DupDelete.TButton",
+                width=12,
+                command=lambda grp=group, i=image_index: self._delete_dup_image(grp, i),
+            ).pack(anchor="w", pady=(4, 0))
+
+    def _toggle_dup_group(self, group: DuplicateGroup) -> None:
+        """
+        Replie ou déplie un groupe, de façon chirurgicale (sans tout reconstruire).
+
+        Replier détruit les tuiles du groupe (libère les widgets) ; déplier les
+        reconstruit (miniatures servies depuis le cache). On ne touche qu'à ce
+        groupe, donc l'opération reste fluide même avec une longue liste.
+        """
+        refs = self.dup_group_widgets.get(id(group))
+        if not refs:
+            return
+
+        gid = id(group)
+        if gid in self.dup_collapsed_group_ids:
+            self.dup_collapsed_group_ids.discard(gid)
+            self._build_dup_group_tiles(group)
+            indicator = "▼"
+        else:
+            self.dup_collapsed_group_ids.add(gid)
+            if refs["tiles"] is not None:
+                refs["tiles"].destroy()
+                refs["tiles"] = None
+            indicator = "▸"
+
+        refs["toggle"].configure(
+            text=f"{indicator}  Groupe {refs['index'] + 1} — {len(group.images)} images"
+        )
+        self._update_dup_summary()
+
+    def _toggle_all_dup_groups(self) -> None:
+        """
+        Replie tous les groupes s'il en reste au moins un déplié, sinon déplie tout.
+
+        Replier tout est le moyen le plus rapide de rendre une très longue liste
+        fluide : il ne reste alors que les en-têtes à l'écran.
+        """
+        any_expanded = any(id(g) not in self.dup_collapsed_group_ids for g in self.dup_groups)
+        if any_expanded:
+            self.dup_collapsed_group_ids = {id(g) for g in self.dup_groups}
+        else:
+            self.dup_collapsed_group_ids.clear()
+        self._render_dup_groups(reset_scroll=False)
+
+    def _make_dup_thumbnail(self, path: Path):
+        """
+        Charge une miniature Tkinter pour une image (ou None en cas d'échec).
+
+        Le résultat est mémorisé dans self.dup_thumbnail_cache : décoder une
+        image (ouverture disque + conversion RGBA + redimensionnement LANCZOS)
+        est coûteux, et l'affichage est reconstruit entièrement à chaque
+        suppression. Sans cache, supprimer une seule carte re-décoderait toutes
+        les images restantes — d'où une lenteur très perceptible.
+
+        Les cartes PNG ont des coins arrondis transparents : on aplatit la
+        transparence sur le fond du canvas pour éviter les traînées visuelles
+        lors du défilement (les zones transparentes laissaient apparaître les
+        pixels précédents).
+        """
+        key = str(path)
+        cached = self.dup_thumbnail_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            return None
+        try:
+            with Image.open(path) as image:
+                preview = image.convert("RGBA")
+                preview.thumbnail((120, 168), Image.Resampling.LANCZOS)
+                # Fond opaque = couleur du canvas (#181818) ; on colle l'image
+                # par-dessus en utilisant son canal alpha comme masque.
+                flattened = Image.new("RGB", preview.size, (24, 24, 24))
+                flattened.paste(preview, (0, 0), preview)
+                thumbnail = ImageTk.PhotoImage(flattened)
+                self.dup_thumbnail_cache[key] = thumbnail
+                return thumbnail
+        except Exception:
+            return None
+
+    def _update_dup_summary(self) -> None:
+        """Met à jour le résumé (groupes / images restantes, groupes repliés)."""
+        collapsed = sum(1 for group in self.dup_groups if id(group) in self.dup_collapsed_group_ids)
+        # Le bouton global bascule entre tout replier et tout déplier ; on
+        # l'active seulement s'il y a des groupes, et son libellé reflète l'action.
+        if hasattr(self, "dup_collapse_all_button"):
+            has_groups = bool(self.dup_groups)
+            all_collapsed = has_groups and collapsed == len(self.dup_groups)
+            self.dup_collapse_all_button.configure(
+                state="normal" if has_groups else "disabled",
+                text="Tout déplier" if all_collapsed else "Tout réduire",
+            )
+
+        if not self.dup_groups:
+            self.dup_summary_var.set("Aucun doublon à afficher.")
+            return
+        total = sum(len(group.images) for group in self.dup_groups)
+        summary = f"{len(self.dup_groups)} groupe(s) de doublons · {total} image(s)."
+        if collapsed:
+            summary += f" {collapsed} replié(s)."
+        self.dup_summary_var.set(summary)
+
+    def _delete_dup_image(self, group: DuplicateGroup, image_index: int) -> None:
+        """
+        Supprime immédiatement le fichier d'une image (un doublon en trop).
+
+        Après suppression, l'image disparaît de son groupe. Si le groupe ne
+        contient plus qu'une seule image (plus aucune ressemblante), il disparaît
+        entièrement de la liste.
+
+        Le groupe est passé par référence (et non par index) pour rester robuste
+        si la liste des groupes change entre l'affichage et le clic.
+        """
+        if not any(grp is group for grp in self.dup_groups) or image_index >= len(group.images):
+            return
+
+        image = group.images[image_index]
+        try:
+            image.path.unlink()
+            self.dup_thumbnail_cache.pop(str(image.path), None)
+            self._dup_log(f"Supprimé: {image.path.name}")
+        except Exception as error:
+            self._dup_log(f"Échec suppression {image.path.name}: {error}")
+            messagebox.showerror("Erreur", f"Impossible de supprimer {image.path.name}:\n{error}")
+            return
+
+        # Retire l'image de son groupe, puis élimine les groupes qui n'ont plus
+        # au moins 2 images (sans doublon restant, ce ne sont plus des doublons).
+        del group.images[image_index]
+        self.dup_groups = [grp for grp in self.dup_groups if len(grp.images) >= 2]
+        # reset_scroll=False : on reste à la même position dans la liste.
+        self._render_dup_groups(reset_scroll=False)
+
+    @staticmethod
+    def _truncate_middle(text: str, max_length: int) -> str:
+        """Tronque un texte trop long en gardant le début et la fin (avec … au milieu)."""
+        if len(text) <= max_length:
+            return text
+        keep = max_length - 1
+        head = keep // 2
+        tail = keep - head
+        return f"{text[:head]}…{text[-tail:]}"
+
+    @staticmethod
+    def _format_size(num_bytes: int) -> str:
+        """Formate une taille de fichier en octets vers une unité lisible (Ko/Mo)."""
+        size = float(num_bytes)
+        for unit in ("o", "Ko", "Mo", "Go"):
+            if size < 1024 or unit == "Go":
+                return f"{size:.0f} {unit}" if unit == "o" else f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} Go"
+
+    # ==========================================================================
     #  DISPATCHER DE MESSAGES (cœur de la communication thread → UI)
     # ==========================================================================
 
@@ -3518,6 +4058,23 @@ class ScryfallArtApp(tk.Tk):
             except queue.Empty:
                 break   # Plus de messages → on sort de la boucle
 
+            # Le dispatch est isolé dans un try : une exception sur un message ne
+            # doit PAS tuer la boucle de polling. Sinon le self.after() final
+            # n'est jamais atteint et toute l'app se fige silencieusement (pas de
+            # console pour voir la trace).
+            try:
+                self._handle_ui_message(kind, message)
+            except Exception as error:
+                self._report_dispatch_error(kind, error)
+        self.after(100, self._poll_messages)
+
+    def _handle_ui_message(self, kind, message) -> None:
+            """
+            Exécute l'action UI correspondant à un message de la file.
+
+            Volontairement indenté comme l'ancien corps de boucle de
+            _poll_messages : cela préserve la longue chaîne if/elif telle quelle.
+            """
             if kind == "log":
                 self._log(str(message))
             elif kind == "set_languages":
@@ -3635,6 +4192,29 @@ class ScryfallArtApp(tk.Tk):
                 self.margin_start_button.configure(state="normal")
                 self.margin_cancel_button.configure(state="disabled")
                 messagebox.showerror("Erreur", str(message))
+            elif kind == "dup_log":
+                self._dup_log(str(message))
+            elif kind == "dup_progress":
+                self._update_progress(self.dup_progress, self.dup_progress_label, str(message))
+            elif kind == "dup_groups":
+                self._receive_dup_groups(message)
+                self.dup_progress.configure(value=self.dup_progress["maximum"])
+                self.dup_progress_label.configure(text="Terminé")
+                self.dup_analyze_button.configure(state="normal")
+                self.dup_cancel_button.configure(state="disabled")
+                if not self.dup_groups:
+                    self._dup_log("Aucun doublon trouvé.")
+            elif kind == "dup_cancelled":
+                self._dup_log(str(message))
+                self.dup_progress_label.configure(text="Annulé")
+                self.dup_analyze_button.configure(state="normal")
+                self.dup_cancel_button.configure(state="disabled")
+            elif kind == "dup_error":
+                self._dup_log(f"Erreur: {message}")
+                self.dup_progress_label.configure(text="Erreur")
+                self.dup_analyze_button.configure(state="normal")
+                self.dup_cancel_button.configure(state="disabled")
+                messagebox.showerror("Erreur", str(message))
             elif kind == "xml_log":
                 self._append_log(self.xml_log, str(message))
             elif kind == "xml_done":
@@ -3649,7 +4229,33 @@ class ScryfallArtApp(tk.Tk):
                 self.xml_generate_button.configure(state="normal")
                 messagebox.showerror("Erreur XML", str(message))
 
-        self.after(100, self._poll_messages)
+    def _report_dispatch_error(self, kind: str, error: Exception) -> None:
+        """
+        Journalise une exception survenue pendant le traitement d'un message UI,
+        sans interrompre la boucle de polling.
+
+        La trace complète est écrite dans dispatch_error.log (à côté de l'app) et
+        un message d'erreur est présenté à l'utilisateur. Avant ce filet de
+        sécurité, une telle exception figeait toute l'application sans laisser de
+        trace visible.
+        """
+        import traceback
+
+        details = traceback.format_exc()
+        try:
+            log_path = Path(__file__).resolve().parent.parent / "dispatch_error.log"
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"--- Erreur sur message '{kind}' ---\n{details}\n")
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(
+                "Erreur interne",
+                f"Une erreur est survenue lors du traitement d'un message ({kind}) :\n"
+                f"{error}\n\nDétails enregistrés dans dispatch_error.log.",
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _update_progress(progress: ttk.Progressbar, label: ttk.Label, message: str, prefix: str = "") -> None:
@@ -3769,6 +4375,16 @@ class ScryfallArtApp(tk.Tk):
         self.margin_log.configure(state="normal")
         self.margin_log.delete("1.0", tk.END)
         self.margin_log.configure(state="disabled")
+
+    def _dup_log(self, message: str) -> None:
+        """Ajoute un message dans le log de l'onglet Doublons."""
+        self._append_log(self.dup_log, message)
+
+    def _clear_dup_log(self) -> None:
+        """Efface tout le contenu du log de l'onglet Doublons."""
+        self.dup_log.configure(state="normal")
+        self.dup_log.delete("1.0", tk.END)
+        self.dup_log.configure(state="disabled")
 
     @staticmethod
     def _append_log(widget: tk.Text, message: str) -> None:

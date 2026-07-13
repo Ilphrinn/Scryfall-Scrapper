@@ -139,6 +139,71 @@ class LocalBulkCatalog:
 
         return result
 
+    def card_names_for(
+        self,
+        requests: Iterable[tuple[str, str, str]],
+    ) -> dict[tuple[str, str, str], str]:
+        """
+        Résout des noms de cartes (anglais/oracle) depuis set + numéro + langue.
+
+        Utilisé par le XML Generator pour retrouver le vrai nom d'une carte à
+        partir d'un nom de fichier du type "FCA_EN_3" (set=fca, langue=en, n°=3),
+        car le frontend MPC Autofill se base sur le nom pour faire le lien.
+
+        Le nom retourné est toujours le nom ANGLAIS/oracle (colonne card_name,
+        qui contient card["name"] et non printed_name), car la base d'images
+        communautaire MPC Autofill est indexée par nom anglais.
+
+        Stratégie par requête :
+        1. Correspondance exacte set + numéro + langue
+        2. Repli : set + numéro toutes langues (au cas où la langue diffère)
+
+        Un index secondaire (set_code, collector_number) est créé à la volée
+        s'il n'existe pas — opération rapide qui ne réindexe PAS le fichier bulk.
+
+        Arguments :
+            requests (Iterable[tuple]) : (set_code, collector_number, language).
+
+        Retourne :
+            dict[tuple, str] : {(set_code, collector_number, language): nom_anglais}.
+                               Les requêtes introuvables sont absentes du dict.
+        """
+        unique = list(dict.fromkeys(requests))   # Dédoublonne en gardant l'ordre
+        if not unique:
+            return {}
+
+        # Étape 1 : Vérifier/créer l'index SQLite3 principal (réindexe si périmé)
+        self._ensure_index()
+
+        result: dict[tuple[str, str, str], str] = {}
+        with closing(sqlite3.connect(self.index_file)) as connection:
+            # Index secondaire pour les recherches par set + numéro (créé une seule
+            # fois, instantané sur une base déjà peuplée — pas de relecture du JSON).
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_prints_set_collnum "
+                "ON prints(set_code, collector_number)"
+            )
+            for set_code, collector_number, language in unique:
+                self._raise_if_cancelled()
+                set_lc = set_code.lower()
+                lang_lc = language.lower()
+                row = connection.execute(
+                    "SELECT card_name FROM prints "
+                    "WHERE set_code = ? AND collector_number = ? AND language = ? LIMIT 1",
+                    (set_lc, collector_number, lang_lc),
+                ).fetchone()
+                if row is None:
+                    # Repli : on ignore la langue (le nom anglais est identique)
+                    row = connection.execute(
+                        "SELECT card_name FROM prints "
+                        "WHERE set_code = ? AND collector_number = ? LIMIT 1",
+                        (set_lc, collector_number),
+                    ).fetchone()
+                if row and row[0]:
+                    result[(set_code, collector_number, language)] = str(row[0])
+
+        return result
+
     # -----------------------------------------------------------------------
     #  Gestion de l'index SQLite3
     # -----------------------------------------------------------------------

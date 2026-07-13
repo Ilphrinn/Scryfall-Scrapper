@@ -126,6 +126,9 @@ class ScryfallClient:
         self.pause_seconds = pause_seconds   # Pause optionnelle entre chaque page de résultats
         # Cache des langues disponibles par set (évite de re-sonder l'API à chaque saisie)
         self._set_languages_cache: dict[str, list[str]] = {}
+        # Cache mémoire des noms de cartes résolus par (set, numéro, langue)
+        # (utilisé par le XML Generator ; évite de redemander la même carte)
+        self._card_name_cache: dict[tuple[str, str, str], str | None] = {}
 
     # -----------------------------------------------------------------------
     #  Méthodes publiques
@@ -328,6 +331,59 @@ class ScryfallClient:
             name=str(raw_card.get("name", "")),
             image_url=image_url,
         )
+
+    def card_name_for(
+        self,
+        set_code: str,
+        collector_number: str,
+        language: str | None = None,
+        on_status: Callable[[str], None] | None = None,
+    ) -> str | None:
+        """
+        Résout le nom ANGLAIS/oracle d'une carte depuis set + numéro (+ langue).
+
+        Utilisé par le XML Generator pour retrouver le vrai nom d'une carte à
+        partir d'un nom de fichier du type "FCA_EN_3". On interroge l'endpoint
+        précis /cards/{set}/{numéro}/{langue} de Scryfall.
+
+        On retourne toujours le champ "name" (nom anglais/oracle) et non
+        "printed_name" (nom traduit), car la base d'images communautaire MPC
+        Autofill est indexée par nom anglais.
+
+        Le résultat est mis en cache en mémoire pour toute la session.
+
+        Arguments :
+            set_code         (str)           : Code du set (ex: "fca").
+            collector_number (str)           : Numéro de collecteur (ex: "3").
+            language         (str|None)      : Langue de l'impression (ex: "en").
+            on_status        (Callable|None) : Fonction de progression.
+
+        Retourne :
+            str | None : Le nom anglais de la carte, ou None si introuvable.
+        """
+        cache_key = (set_code.lower(), str(collector_number), (language or "").lower())
+        if cache_key in self._card_name_cache:
+            return self._card_name_cache[cache_key]
+
+        url = self._card_url(CardRequest(
+            set_code=set_code,
+            collector_number=str(collector_number),
+            language=language or None,
+        ))
+        if on_status:
+            on_status(f"Résolution du nom: {set_code.upper()} #{collector_number}")
+        try:
+            raw_card = self._get_json(url, on_status)
+        except RuntimeError as error:
+            if "HTTP 404" in str(error):
+                self._card_name_cache[cache_key] = None   # Mémorise l'absence
+                return None
+            raise
+
+        name = raw_card.get("name")
+        resolved = str(name) if name else None
+        self._card_name_cache[cache_key] = resolved
+        return resolved
 
     def search_card_prints(
         self,

@@ -36,11 +36,13 @@ from __future__ import annotations
 import json          # Lecture/écriture JSON (sauvegarde des états, cache)
 import queue         # File de messages thread-safe (communication worker → UI)
 import hashlib       # Génération d'empreintes SHA1 (noms de fichiers cache)
+import re            # Expressions régulières (analyse des noms de fichiers)
 import sys           # Informations système (platform, chemin d'exécution)
 import threading     # Création de threads pour les opérations longues
 import tkinter as tk  # Bibliothèque graphique principale
 from pathlib import Path              # Manipulation de chemins de fichiers
 from shutil import copyfileobj, rmtree  # Copie de fichiers et suppression de dossiers
+from typing import Callable           # Types pour les fonctions de rappel (callbacks)
 from tkinter import filedialog, messagebox, ttk  # Dialogues et widgets avancés Tkinter
 from urllib.parse import urlparse     # Analyse d'URLs
 from urllib.request import Request, urlopen   # Requêtes HTTP pour les prévisualisations
@@ -55,6 +57,79 @@ from .margin_creator import create_black_margins
 from .models import CardPrint, CardRequest, DecklistEntry, SetRequest
 from .scryfall_client import PRINT_SEARCH_CACHE_DIR, ScryfallClient, USER_AGENT
 from .url_parser import parse_scryfall_url
+
+
+# =============================================================================
+#  OUTILS DE NOMMAGE POUR LE XML GENERATOR (MPC Autofill)
+# =============================================================================
+# Les fichiers téléchargés par set sont nommés "{SET}_{LANGUE}_{NUMÉRO}"
+# (ex: "FCA_EN_3"), éventuellement suivis de suffixes de traitement ajoutés par
+# le Margin Creator / DPI Upscaler (ex: "_1200DPI", "_Marged"). Le frontend MPC
+# Autofill (mpcautofill.github.io) se sert du NOM pour faire le lien avec la base
+# de cartes : un nom illisible comme "fca en 3 1200dpi marged" donne 65 résultats
+# approximatifs. On résout donc le vrai nom de la carte via Scryfall (set+numéro).
+
+# Langues Scryfall reconnues (pour valider le 2ᵉ segment d'un nom de fichier).
+KNOWN_CARD_LANGUAGES = frozenset({
+    "en", "fr", "de", "es", "it", "pt", "ja", "ko", "ru",
+    "zhs", "zht", "he", "la", "grc", "ar", "sa", "ph", "qya",
+})
+
+# Suffixes de traitement ajoutés en fin de nom de fichier, à retirer avant analyse.
+# Ex: "_1200DPI", "_600DPI", "_Marged", "_Trimmed", "_Cropped", "_Upscaled".
+_PROCESSING_SUFFIX_RE = re.compile(
+    r"_(?:\d+DPI|Marged|Trimmed|Cropped|Upscaled)$",
+    flags=re.IGNORECASE,
+)
+
+# Caractères interdits dans un nom de fichier Windows (pour assainir un nom de carte).
+_INVALID_FILENAME_CHARS = '<>:"/\\|?*'
+
+
+def _strip_processing_suffixes(stem: str) -> str:
+    """Retire les suffixes de traitement répétés (ex: "Forest_1200DPI_Marged" → "Forest")."""
+    previous = None
+    while previous != stem:
+        previous = stem
+        stem = _PROCESSING_SUFFIX_RE.sub("", stem)
+    return stem
+
+
+def parse_card_filename(stem: str) -> tuple[str, str, str] | None:
+    """
+    Analyse un nom de fichier "{SET}_{LANGUE}_{NUMÉRO}[...]" en ses composants.
+
+    Reconnaît les noms produits par le téléchargement de set ("FCA_EN_3") comme
+    ceux du Decklist downloader ("FIN_FR_101_Cloud Midgar Mercenary"). Le 2ᵉ
+    segment doit être une langue Scryfall connue, sinon on considère que le nom
+    n'est pas un nom généré par l'application.
+
+    Arguments :
+        stem (str) : Nom de fichier sans extension.
+
+    Retourne :
+        tuple (set_code, collector_number, language) si reconnu, sinon None.
+    """
+    cleaned = _strip_processing_suffixes(stem)
+    parts = cleaned.split("_")
+    if len(parts) >= 3 and parts[1].lower() in KNOWN_CARD_LANGUAGES and parts[0] and parts[2]:
+        return parts[0], parts[2], parts[1].lower()
+    return None
+
+
+def safe_card_filename(name: str) -> str:
+    """
+    Assainit un nom de carte pour servir de nom de fichier (Windows compatible).
+
+    Conserve les espaces et la casse (ex: "Lightning Bolt"), remplace les
+    caractères interdits par un espace et supprime les points/espaces en fin.
+    """
+    cleaned = "".join(
+        " " if (char in _INVALID_FILENAME_CHARS or ord(char) < 32) else char
+        for char in name
+    )
+    cleaned = " ".join(cleaned.split()).rstrip(". ")
+    return cleaned or "card"
 
 
 # =============================================================================
@@ -1903,82 +1978,235 @@ class ScryfallArtApp(tk.Tk):
                     "Cardback.jpg introuvable. Chemins vérifiés :\n" + "\n".join(f"  {p}" for p in checked)))
                 return
 
-            # --- Construction du XML en mémoire ---
-            order = Element("order")
-
-            details = SubElement(order, "details")
-            SubElement(details, "quantity").text = str(total_cards)
-            SubElement(details, "stock").text = stock
-            SubElement(details, "foil").text = "true" if foil else "false"
-
-            fronts_el = SubElement(order, "fronts")
-            seen_hashes: set[str] = set()
+            # --- Résolution des vrais noms de cartes (set+numéro → nom anglais) ---
+            # Liste des hash uniques dans l'ordre d'apparition + fichier canonique.
+            ordered_hashes: list[str] = []
+            seen_order: set[str] = set()
             for f in image_files:
                 h = file_hashes[f]
-                if h in seen_hashes:
-                    continue
-                seen_hashes.add(h)
+                if h not in seen_order:
+                    seen_order.add(h)
+                    ordered_hashes.append(h)
+            canonical_files = [hash_canonical[h] for h in ordered_hashes]
 
-                canonical  = hash_canonical[h]
-                clean_id   = self._xml_file_in_zip(canonical)   # ex: "Sol Ring 1200DPI Marged.jpg"
-                clean_name = self._xml_clean_name(canonical)     # idem mais .jpeg si .jpg
-                slots_str  = ",".join(str(s) for s in hash_slots[h])
-                group_size = len(hash_slots[h])
+            resolved_names = self._resolve_card_names(
+                canonical_files,
+                lambda m: self.messages.put(("xml_log", m)),
+            )
 
-                card = SubElement(fronts_el, "card")
-                SubElement(card, "id").text = f"./Artwork/{clean_id}"
-                SubElement(card, "sourceType").text = "Local File"
-                SubElement(card, "slots").text = slots_str
-                SubElement(card, "name").text = clean_name
-                SubElement(card, "query").text = self._xml_query_from_filename(canonical)
+            # Attribution des noms d'affichage : "(Alt N)" pour les arts DISTINCTS
+            # d'une même carte. Le champ <query> garde le nom de base (sans Alt) car
+            # c'est lui qui sert au frontend MPC Autofill pour retrouver la carte.
+            name_counts: dict[str, int] = {}
+            hash_meta: dict[str, tuple[str, str, str]] = {}   # h -> (fichier_zip, <name>, <query>)
+            for h, f in zip(ordered_hashes, canonical_files):
+                resolved = resolved_names.get(f)
+                if resolved:
+                    base_stem = safe_card_filename(resolved)
+                    query = " ".join(re.sub(r"[^a-z0-9]+", " ", resolved.lower()).split())
+                else:
+                    # Repli : ancien comportement (nom de fichier nettoyé)
+                    base_stem = f.stem.replace("_", " ").replace("'", " ")
+                    query = self._xml_query_from_filename(f)
 
-                if group_size > 1:
-                    self.messages.put(("xml_log", f"Groupé ×{group_size} : {clean_id}"))
+                key = base_stem.lower()
+                seen_count = name_counts.get(key, 0)
+                name_counts[key] = seen_count + 1
+                display_stem = base_stem if seen_count == 0 else f"{base_stem} (Alt {seen_count})"
 
-            all_slots = ",".join(str(i) for i in range(total_cards))
-            backs_el = SubElement(order, "backs")
-            back_el = SubElement(backs_el, "card")
-            SubElement(back_el, "id").text = f"./Artwork/{self._xml_file_in_zip(cardback)}"
-            SubElement(back_el, "sourceType").text = "Local File"
-            SubElement(back_el, "slots").text = all_slots
-            SubElement(back_el, "name").text = self._xml_clean_name(cardback)
-            SubElement(back_el, "query").text = "cardback"
+                file_in_zip = f"{display_stem}{f.suffix}"
+                name_field = f"{display_stem}.jpeg" if f.suffix.lower() == ".jpg" else f"{display_stem}{f.suffix}"
+                hash_meta[h] = (file_in_zip, name_field, query)
 
-            SubElement(order, "cardback")
+            # --- Découpage en commandes de ≤ MAX_ORDER cartes ---
+            # MPC Autofill / MakePlayingCards plafonnent une commande à 612 cartes
+            # (le plus grand "bracket"). Le frontend du site plante silencieusement
+            # dès qu'un <slots> dépasse cet index (newMembers[slot] est undefined),
+            # ce qui empêchait l'import de gros sets. On découpe donc les cartes en
+            # lots successifs de 612 (« remplir puis reste »), chacun avec son propre
+            # XML aux slots renumérotés à partir de 0. Tous les lots partagent le même
+            # dossier Artwork/ dans l'archive (images importées une seule fois).
+            MAX_ORDER = 612
+            batches = [
+                list(range(start, min(start + MAX_ORDER, total_cards)))
+                for start in range(0, total_cards, MAX_ORDER)
+            ]
+            batch_count = len(batches)
 
-            indent(order, space="    ")
-            xml_bytes = (
-                '<?xml version="1.0" encoding="utf-8"?>\n'
-                + tostring(order, encoding="unicode")
-            ).encode("utf-8")
+            cardback_id = f"./Artwork/{self._xml_file_in_zip(cardback)}"
+            cardback_name = self._xml_clean_name(cardback)
 
-            # --- Création de l'archive ZIP (tout en mémoire, rien sur le disque sauf le .zip final) ---
+            def build_order_xml(global_slots: list[int]) -> bytes:
+                """Construit le XML d'un lot.
+
+                `global_slots` = indices physiques globaux des cartes du lot ; ils
+                sont renumérotés localement à partir de 0. Les doublons (même hash)
+                présents dans ce lot sont regroupés en une seule entrée <card>.
+                Le nom de fichier et le <query> proviennent de `hash_meta` (calculé
+                globalement) pour rester cohérents avec le dossier Artwork/ partagé.
+                """
+                order = Element("order")
+
+                details = SubElement(order, "details")
+                SubElement(details, "quantity").text = str(len(global_slots))
+                SubElement(details, "stock").text = stock
+                SubElement(details, "foil").text = "true" if foil else "false"
+
+                # Regroupement des doublons DANS ce lot (slots locaux 0..n-1)
+                local_hash_slots: dict[str, list[int]] = {}
+                local_order: list[str] = []
+                for local_slot, global_slot in enumerate(global_slots):
+                    h = file_hashes[image_files[global_slot]]
+                    if h not in local_hash_slots:
+                        local_hash_slots[h] = []
+                        local_order.append(h)
+                    local_hash_slots[h].append(local_slot)
+
+                fronts_el = SubElement(order, "fronts")
+                for h in local_order:
+                    file_in_zip, name_field, query = hash_meta[h]
+                    card = SubElement(fronts_el, "card")
+                    SubElement(card, "id").text = f"./Artwork/{file_in_zip}"
+                    SubElement(card, "sourceType").text = "Local File"
+                    SubElement(card, "slots").text = ",".join(str(s) for s in local_hash_slots[h])
+                    SubElement(card, "name").text = name_field
+                    SubElement(card, "query").text = query
+
+                local_all_slots = ",".join(str(i) for i in range(len(global_slots)))
+                backs_el = SubElement(order, "backs")
+                back_el = SubElement(backs_el, "card")
+                SubElement(back_el, "id").text = cardback_id
+                SubElement(back_el, "sourceType").text = "Local File"
+                SubElement(back_el, "slots").text = local_all_slots
+                SubElement(back_el, "name").text = cardback_name
+                SubElement(back_el, "query").text = "cardback"
+
+                SubElement(order, "cardback")
+
+                indent(order, space="    ")
+                return (
+                    '<?xml version="1.0" encoding="utf-8"?>\n'
+                    + tostring(order, encoding="unicode")
+                ).encode("utf-8")
+
+            # --- Création de l'archive ZIP (Artwork/ partagé + un XML par lot) ---
             output.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as zf:
-                # 1. XML à la racine de l'archive
-                zf.writestr(f"{name}.xml", xml_bytes)
+                # 1. Un XML par lot (slots renumérotés à partir de 0)
+                for index, global_slots in enumerate(batches, start=1):
+                    xml_name = (
+                        f"{name}.xml" if batch_count == 1
+                        else f"{name} ({index} sur {batch_count}).xml"
+                    )
+                    zf.writestr(xml_name, build_order_xml(global_slots))
+                    if batch_count > 1:
+                        self.messages.put(("xml_log",
+                            f"Lot {index}/{batch_count} : {len(global_slots)} carte(s) → {xml_name}"))
 
-                # 2. Images recto dans le sous-dossier Artwork/
-                seen_in_zip: set[str] = set()
-                for f in image_files:
-                    h = file_hashes[f]
-                    if h in seen_in_zip:
-                        continue
-                    seen_in_zip.add(h)
-                    zf.write(hash_canonical[h], arcname=f"Artwork/{self._xml_file_in_zip(hash_canonical[h])}")
+                # 2. Images recto (une par image unique) dans Artwork/ (partagé entre les lots)
+                for h in ordered_hashes:
+                    file_in_zip, _, _ = hash_meta[h]
+                    zf.write(hash_canonical[h], arcname=f"Artwork/{file_in_zip}")
 
                 # 3. Dos : Cardback.jpg dans Artwork/
                 zf.write(cardback, arcname=f"Artwork/{self._xml_file_in_zip(cardback)}")
 
-            unique_images = len(seen_hashes)
+            unique_images = len(ordered_hashes)
             grouped = total_cards - unique_images
-            summary = f"{total_cards} carte(s), {unique_images} image(s) unique(s)"
+            resolved_count = sum(1 for f in canonical_files if resolved_names.get(f))
+            summary = (
+                f"{total_cards} carte(s), {unique_images} image(s) unique(s), "
+                f"{resolved_count}/{unique_images} nom(s) résolu(s)"
+            )
             if grouped:
                 summary += f", {grouped} doublon(s) regroupé(s)"
+            if batch_count > 1:
+                summary += f", {batch_count} commande(s) de ≤{MAX_ORDER} cartes"
             self.messages.put(("xml_done", f"Archive prête : {summary} → {output.name}"))
 
         except Exception as error:
             self.messages.put(("xml_error", self._format_error(error)))
+
+    def _resolve_card_names(
+        self,
+        files: list[Path],
+        on_log: Callable[[str], None] | None = None,
+    ) -> dict[Path, str | None]:
+        """
+        Résout le vrai nom (anglais) des cartes à partir de leurs noms de fichiers.
+
+        Pour chaque fichier nommé "{SET}_{LANGUE}_{NUMÉRO}[...]" (ex: "FCA_EN_3"),
+        on retrouve le nom de la carte via Scryfall. On privilégie le catalogue
+        local hors-ligne (fichier all-cards) s'il est présent — rapide et idéal
+        pour les gros lots — sinon on interroge l'API Scryfall (avec cache mémoire).
+
+        Les fichiers dont le nom n'est pas reconnu (ou introuvables) renvoient
+        None : l'appelant se rabat alors sur le nom de fichier nettoyé.
+
+        Arguments :
+            files  (list[Path])    : Fichiers image à résoudre.
+            on_log (Callable|None) : Journalisation facultative.
+
+        Retourne :
+            dict[Path, str|None] : {fichier: nom anglais résolu ou None}.
+        """
+        def log(message: str) -> None:
+            if on_log:
+                on_log(message)
+
+        # Analyse des noms de fichiers → clés (set, numéro, langue)
+        file_keys: dict[Path, tuple[str, str, str]] = {}
+        for f in files:
+            parsed = parse_card_filename(f.stem)
+            if parsed is not None:
+                file_keys[f] = parsed
+
+        result: dict[Path, str | None] = {f: None for f in files}
+        if not file_keys:
+            log("Aucun nom de type SET_LANGUE_NUMÉRO détecté ; noms de fichiers conservés.")
+            return result
+
+        unique_keys = list(dict.fromkeys(file_keys.values()))
+        names_by_key: dict[tuple[str, str, str], str] = {}
+
+        # 1) Catalogue local hors-ligne s'il est présent (rapide, idéal gros lots)
+        bulk_file = self._find_local_bulk_file()
+        if bulk_file is not None:
+            log(f"Résolution des noms via le bulk local : {bulk_file.name}…")
+            try:
+                catalog = LocalBulkCatalog(bulk_file=bulk_file, on_status=log)
+                names_by_key.update(catalog.card_names_for(unique_keys))
+            except Exception as error:
+                log(f"Bulk local indisponible ({error}); bascule sur l'API Scryfall.")
+
+        # 2) API Scryfall en ligne pour les clés non encore résolues
+        missing = [k for k in unique_keys if k not in names_by_key]
+        if missing:
+            log(f"Résolution de {len(missing)} nom(s) via l'API Scryfall…")
+            client = self._xml_name_client()
+            for set_code, number, lang in missing:
+                try:
+                    resolved = client.card_name_for(set_code, number, lang, on_status=log)
+                except Exception as error:
+                    log(f"Échec résolution {set_code.upper()} #{number}: {error}")
+                    resolved = None
+                if resolved:
+                    names_by_key[(set_code, number, lang)] = resolved
+
+        for f, key in file_keys.items():
+            result[f] = names_by_key.get(key)
+
+        resolved_total = sum(1 for value in result.values() if value)
+        log(f"{resolved_total}/{len(files)} nom(s) de carte résolu(s).")
+        return result
+
+    def _xml_name_client(self) -> ScryfallClient:
+        """Retourne un client Scryfall partagé (cache mémoire) pour la résolution des noms."""
+        client = getattr(self, "_xml_name_client_instance", None)
+        if client is None:
+            client = ScryfallClient()
+            self._xml_name_client_instance = client
+        return client
 
     @staticmethod
     def _xml_clean_name(f: Path) -> str:
